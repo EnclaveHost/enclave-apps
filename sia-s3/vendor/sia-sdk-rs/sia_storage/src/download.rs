@@ -1,0 +1,2027 @@
+use std::collections::VecDeque;
+use std::fmt::Debug;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Poll, ready};
+
+use crate::congestion::{InflightController, SamplePermit};
+use crate::encryption::{Chacha20Cipher, EncryptionKey, encrypt_recovered_shards};
+use crate::erasure_coding::{self, ErasureCoder};
+use crate::hosts::{Hosts, InflightGuard, rpc_idle_timeout, RPCError};
+use crate::slabs::SlabVersion::{V0, V1};
+use crate::time::{Duration, Instant, sleep};
+use crate::tokens::AccountTokenSource;
+use crate::{DownloadOptions, Object, Sector, ShardProgress, ShardProgressCallback, Slab};
+use bytes::{Buf, Bytes};
+use log::{debug, warn};
+use sia_core::rhp4::SEGMENT_SIZE;
+use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::watch;
+use tokio::task::JoinSet;
+use tokio_util::task::AbortOnDropHandle;
+
+/// Errors that can occur during a download.
+#[derive(Debug, Error)]
+pub enum DownloadError {
+    /// An I/O error occurred while writing the downloaded data.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// The erasure decoder encountered an error.
+    #[error("encoder error: {0}")]
+    Encoder(#[from] erasure_coding::Error),
+
+    /// Not enough shards were successfully downloaded to recover the data.
+    #[error("not enough shards: {0}/{1}")]
+    NotEnoughShards(usize, usize),
+
+    /// The requested range is out of bounds.
+    #[error("invalid range: {0}-{1}")]
+    OutOfRange(usize, usize),
+
+    /// An internal task join error.
+    #[error("join error: {0}")]
+    JoinError(#[from] tokio::task::JoinError),
+
+    /// The slab metadata is invalid.
+    #[error("invalid slab: {0}")]
+    InvalidSlab(String),
+
+    /// A host RPC error occurred during the download.
+    #[error("rhp4 error: {0}")]
+    RPC(#[from] RPCError),
+
+    /// A custom error.
+    #[error("custom error: {0}")]
+    Custom(String),
+
+    /// The download previously errored and can no longer be read from.
+    #[error("download errored")]
+    Errored,
+}
+
+struct SectorTask {
+    sector: Sector,
+    shard_index: usize,
+    attempts: usize,
+}
+
+const MAX_SECTOR_ATTEMPTS: usize = 3;
+
+/// A chunk may only race slow hosts while it is within `n` chunks of the read head.
+/// Racing further ahead steals capacity from chunks the reader needs first.
+const RACE_WINDOW: usize = 3;
+
+const RACE_FACTOR: f64 = 1.5;
+
+const INITIAL_INFLIGHT: usize = 8;
+const MIN_INFLIGHT: usize = 1;
+
+/// Memory-derived ceiling on buffered chunks; the controller adapts at or below
+/// it.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn default_chunks_in_memory() -> usize {
+    (crate::default_memory_budget() / MAX_CHUNK_SIZE as u64).max(1) as usize
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn default_chunks_in_memory() -> usize {
+    128
+}
+
+struct AwaitingRecovery {
+    /// The sectors to download for this slab, paired with their inflight guards
+    /// if they were reserved by `SlabRecovery::new`. Guards are held for the
+    /// duration of the RPC in `SlabRecovery::recover_shard` to ensure the
+    /// reservation is released on completion or error.
+    sectors: Vec<(SectorTask, Option<InflightGuard>)>,
+    /// The slab's shard count: its sectors before `prioritize` dropped those
+    /// without a known host. A shard keeps its original slab index, so the
+    /// recovered shards are laid out over all of them, never over the subset.
+    total_shards: usize,
+    /// This chunk's position in download order. Compared against `popped`
+    /// to decide whether the chunk is close enough to the read head to race.
+    seq: usize,
+    /// The reader was already waiting on this chunk when it was admitted, so
+    /// every sector is read at once rather than racing slow hosts in.
+    head: bool,
+    /// Counts the chunks handed to the reader so far. `recover_shards`
+    /// subscribes to it; holding a sender keeps the channel open so the
+    /// `changed` arm cannot fail.
+    popped: watch::Sender<usize>,
+}
+
+struct ShardsRecovered {
+    shard_offset: usize,
+    shards: Vec<Option<Vec<u8>>>,
+    slowest_winner: Option<Duration>,
+}
+
+struct SlabDecoded {
+    data_shards: Vec<Bytes>,
+    slowest_winner: Option<Duration>,
+}
+
+struct DownloadResult {
+    task: SectorTask,
+    elapsed: Duration,
+    result: Result<Bytes, RPCError>,
+}
+
+/// State machine for recovering a slab. This provides a more structured
+/// way to manage the process of downloading and decrypting shards. The primary
+/// benefit is if we want to maintain a version of the download logic
+/// for WASM, we can reuse the state machine and its await points and swap
+/// out the async primitives.
+struct SlabRecovery<State> {
+    client: Hosts,
+    controller: Arc<InflightController>,
+    tokens: AccountTokenSource,
+    /// Sampled when the chunk was admitted. Sector reads report timeouts under
+    /// it, so a chunk from the old limit cannot drive a second back-off.
+    permit: SamplePermit,
+
+    slab_index: usize,
+    min_shards: usize,
+    encryption_key: EncryptionKey,
+    offset: usize,
+    length: usize,
+
+    state: State,
+}
+
+impl SlabRecovery<AwaitingRecovery> {
+    fn new<S: Into<AccountTokenSource>>(
+        client: Hosts,
+        controller: Arc<InflightController>,
+        tokens: S,
+        permit: SamplePermit,
+        slab: ChunkSlab,
+        seq: usize,
+        popped: watch::Sender<usize>,
+    ) -> Result<Self, DownloadError> {
+        let tokens = tokens.into();
+        if slab.slab.min_shards == 0 {
+            return Err(DownloadError::InvalidSlab(
+                "min_shards cannot be 0".to_string(),
+            ));
+        } else if slab.slab.min_shards as usize > slab.slab.sectors.len() {
+            return Err(DownloadError::InvalidSlab(format!(
+                "min_shards {} cannot be greater than number of sectors {}",
+                slab.slab.min_shards,
+                slab.slab.sectors.len()
+            )));
+        }
+
+        let total_shards = slab.slab.sectors.len();
+        let mut sectors = slab
+            .slab
+            .sectors
+            .iter()
+            .enumerate()
+            .map(|(i, sector)| SectorTask {
+                sector: sector.clone(),
+                shard_index: i,
+                attempts: 0,
+            })
+            .collect::<Vec<_>>();
+        client.prioritize(&mut sectors, |task| &task.sector.host_key);
+
+        let min_shards = slab.slab.min_shards as usize;
+        if sectors.len() < min_shards {
+            return Err(DownloadError::NotEnoughShards(sectors.len(), min_shards));
+        }
+
+        // Reserve inflight slots for the top `min_shards` hosts now, while
+        // we still hold the synchronous call frame. `Download::new` queues
+        // many `SlabRecovery::new` calls back-to-back; without this, all of
+        // them would prioritize against the same all-zero inflight
+        // snapshot and pile onto the same fastest hosts. The guards travel
+        // into the spawned read tasks via `recover_shards` and drop with
+        // them; failure/timeout retries reserve on demand from `remaining`.
+        // The head chunk reads every sector, so it reserves them all.
+        let head = seq <= *popped.borrow();
+        let reserved = if head { sectors.len() } else { min_shards };
+        let sectors = sectors
+            .into_iter()
+            .enumerate()
+            .map(|(i, task)| {
+                if i < reserved {
+                    let guard = client.reserve_inflight_download(&task.sector.host_key);
+                    (task, guard)
+                } else {
+                    (task, None)
+                }
+            })
+            .collect();
+
+        Ok(Self {
+            client,
+            controller,
+            tokens,
+            permit,
+            slab_index: slab.index,
+            min_shards,
+            encryption_key: slab.slab.encryption_key,
+            offset: slab.slab.offset as usize,
+            length: slab.slab.length as usize,
+            state: AwaitingRecovery {
+                sectors,
+                total_shards,
+                seq,
+                head,
+                popped,
+            },
+        })
+    }
+
+    fn recover_shard(
+        &self,
+        task: SectorTask,
+        inflight: Option<InflightGuard>,
+        sector_offset: usize,
+        sector_length: usize,
+    ) -> impl Future<Output = DownloadResult> + 'static {
+        let client = self.client.clone();
+        let tokens = self.tokens.clone();
+        let controller = self.controller.clone();
+        let permit = self.permit;
+        async move {
+            // Hold the inflight reservation for the duration of the RPC. The
+            // guard was created by the caller before spawning so the load is
+            // visible to concurrent `prioritize` calls, then dropped here on
+            // either success or error.
+            let _inflight = inflight;
+            // No RPC is attempted without a token, so nothing has elapsed.
+            let token = match tokens.token(task.sector.host_key) {
+                Ok(token) => token,
+                Err(error) => {
+                    return DownloadResult {
+                        task,
+                        elapsed: Duration::ZERO,
+                        result: Err(error),
+                    };
+                }
+            };
+            let start = Instant::now();
+            let result = client
+                .read_sector(
+                    task.sector.host_key,
+                    token,
+                    task.sector.root,
+                    sector_offset,
+                    sector_length,
+                    rpc_idle_timeout(),
+                )
+                .await;
+            let elapsed = start.elapsed();
+            if matches!(&result, Err(RPCError::Rhp(e)) if e.is_timeout()) {
+                controller.record_timeout(permit, task.sector.host_key);
+            }
+            DownloadResult {
+                task,
+                result,
+                elapsed,
+            }
+        }
+    }
+
+    async fn recover_shards(
+        mut self,
+        shard_downloaded: Option<ShardProgressCallback>,
+    ) -> Result<SlabRecovery<ShardsRecovered>, DownloadError> {
+        let mut shard_tasks = JoinSet::new();
+        let mut shards = vec![None; self.state.total_shards];
+        let mut sectors = VecDeque::from(std::mem::take(&mut self.state.sectors));
+        let seq = self.state.seq;
+        let mut popped_rx = self.state.popped.subscribe();
+
+        // compute the sector aligned region to download
+        let min_shards = self.min_shards;
+        let chunk_size = SEGMENT_SIZE * min_shards;
+        let start = (self.offset / chunk_size) * SEGMENT_SIZE;
+        let end = (self.offset + self.length).div_ceil(chunk_size) * SEGMENT_SIZE;
+        let shard_offset = start;
+        let shard_length = end - start;
+        let race_timeout = self
+            .client
+            .read_estimate(shard_length as u32)
+            .mul_f64(RACE_FACTOR);
+
+        // overprovision the recovery to reduce tail latency from slow hosts;
+        // the chunk the reader is waiting on tries every host at once
+        let spawn_shards = if self.state.head {
+            sectors.len()
+        } else {
+            (min_shards * 3 / 2).min(sectors.len())
+        };
+        for (task, inflight) in sectors.drain(..spawn_shards) {
+            join_set_spawn!(
+                &mut shard_tasks,
+                self.recover_shard(task, inflight, shard_offset, shard_length)
+            );
+        }
+        let mut recovered_shards: usize = 0;
+        let mut slowest_winner: Option<Duration> = None;
+        let mut eligible = seq < popped_rx.borrow_and_update().saturating_add(RACE_WINDOW);
+        let mut head = self.state.head;
+        let mut last_event = Instant::now();
+
+        loop {
+            tokio::select! {
+                Some(res) = shard_tasks.join_next() => {
+                    last_event = Instant::now();
+                    let DownloadResult{ result, task, elapsed } = res?;
+                    match result {
+                        Ok(data) => {
+                            // a shard goes to its original slab index; one outside the slab, or one
+                            // recovered twice, is refused rather than counted or overwritten
+                            let total_shards = shards.len();
+                            let Some(slot) = shards.get_mut(task.shard_index) else {
+                                return Err(DownloadError::InvalidSlab(format!(
+                                    "shard index {} is outside the slab's {total_shards} shards",
+                                    task.shard_index
+                                )));
+                            };
+                            if slot.is_some() {
+                                return Err(DownloadError::InvalidSlab(format!(
+                                    "shard {} was recovered twice",
+                                    task.shard_index
+                                )));
+                            }
+                            recovered_shards += 1;
+                            slowest_winner = Some(slowest_winner.unwrap_or_default().max(elapsed));
+                            let shard_size = data.len();
+                            *slot = Some(Vec::from(data));
+                            if recovered_shards <= min_shards && let Some(callback) = &shard_downloaded {
+                                callback(ShardProgress {
+                                    host_key: task.sector.host_key,
+                                    shard_index: task.shard_index,
+                                    slab_index: self.slab_index,
+                                    shard_size,
+                                    elapsed,
+                                });
+                            }
+                            debug!("slab {} shard {} download from {} complete after {elapsed:?} ({recovered_shards}/{min_shards} shards)", self.slab_index, task.shard_index, task.sector.host_key);
+                            if recovered_shards >= min_shards {
+                                return Ok(SlabRecovery {
+                                    client: self.client,
+                                    controller: self.controller,
+                                    tokens: self.tokens,
+                                    permit: self.permit,
+                                    min_shards,
+                                    slab_index: self.slab_index,
+                                    encryption_key: self.encryption_key,
+                                    offset: self.offset,
+                                    length: self.length,
+                                    state: ShardsRecovered {
+                                        shard_offset,
+                                        shards,
+                                        slowest_winner,
+                                    },
+                                });
+                            }
+                        },
+                        Err(e) => {
+                            let mut task = task;
+                            task.attempts += 1;
+                            warn!(
+                                "slab {} shard {} download from {} failed after {elapsed:?} (attempt {}/{MAX_SECTOR_ATTEMPTS}) ({recovered_shards}/{min_shards} shards): {e}",
+                                self.slab_index, task.shard_index, task.sector.host_key, task.attempts,
+                            );
+                            if task.attempts < MAX_SECTOR_ATTEMPTS {
+                                // retry behind the sectors that have not been attempted yet
+                                sectors.push_back((task, None));
+                            }
+                            if recovered_shards + shard_tasks.len() + sectors.len() < min_shards {
+                                return Err(DownloadError::NotEnoughShards(recovered_shards, min_shards));
+                            } else if let Some((task, _)) = sectors.pop_front() {
+                                let inflight = self.client.reserve_inflight_download(&task.sector.host_key);
+                                join_set_spawn!(&mut shard_tasks, self.recover_shard(task, inflight, shard_offset, shard_length));
+                            }
+                        },
+                    }
+                },
+                // Fires once racing will not steal work from more important chunks and the race timeout has elapsed
+                _ = sleep((last_event + race_timeout).saturating_duration_since(Instant::now())), if eligible && !sectors.is_empty() => {
+                    let elapsed = last_event.elapsed();
+                    last_event = Instant::now();
+                    let (task, _) = sectors.pop_front().expect("sectors should not be empty");
+                    let inflight = self.client.reserve_inflight_download(&task.sector.host_key);
+                    debug!("chunk {seq} racing slow host with {} after {:?}", task.sector.host_key, elapsed);
+                    join_set_spawn!(&mut shard_tasks, self.recover_shard(task, inflight, shard_offset, shard_length));
+                },
+                // Fires when the reader brings this chunk into the race window, and again when it
+                // reaches the chunk itself: a chunk the reader is waiting on races every remaining host at once
+                Ok(popped) = popped_rx.wait_for(|popped| seq <= *popped || (!eligible && seq < popped.saturating_add(RACE_WINDOW))), if !head && (!eligible || !sectors.is_empty()) => {
+                    eligible = true;
+                    if seq <= *popped {
+                        head = true;
+                        debug!("chunk {seq} reached the read head, racing {} remaining hosts", sectors.len());
+                        for (task, _) in sectors.drain(..) {
+                            let inflight = self.client.reserve_inflight_download(&task.sector.host_key);
+                            join_set_spawn!(&mut shard_tasks, self.recover_shard(task, inflight, shard_offset, shard_length));
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
+
+impl SlabRecovery<ShardsRecovered> {
+    fn decode(self) -> Result<SlabRecovery<SlabDecoded>, DownloadError> {
+        let parity_shards = self.state.shards.len() - self.min_shards;
+        let rs = ErasureCoder::new(self.min_shards, parity_shards)?;
+        let mut shards = self.state.shards;
+        // decrypt the downloaded shards in place and recover the data shards
+        encrypt_recovered_shards(
+            &self.encryption_key,
+            0,
+            self.state.shard_offset,
+            &mut shards,
+        );
+        rs.reconstruct_data_shards(&mut shards)?;
+        let data_shards = shards
+            .into_iter()
+            .take(self.min_shards)
+            .map(|s| Bytes::from(s.unwrap())) // safe: data shards were just reconstructed
+            .collect();
+        Ok(SlabRecovery {
+            client: self.client,
+            controller: self.controller,
+            tokens: self.tokens,
+            permit: self.permit,
+            min_shards: self.min_shards,
+            slab_index: self.slab_index,
+            encryption_key: self.encryption_key,
+            offset: self.offset,
+            length: self.length,
+            state: SlabDecoded {
+                data_shards,
+                slowest_winner: self.state.slowest_winner,
+            },
+        })
+    }
+}
+
+impl SlabRecovery<SlabDecoded> {
+    /// The duration of the slowest completed shard that contributed to the
+    /// chunk's recovery.
+    fn slowest_winner(&self) -> Option<Duration> {
+        self.state.slowest_winner
+    }
+
+    async fn write<W: AsyncWrite + Unpin>(self, w: &mut W) -> Result<(), DownloadError> {
+        let skip = self.offset % (SEGMENT_SIZE * self.state.data_shards.len());
+        ErasureCoder::write_data_shards(w, &self.state.data_shards, skip, self.length).await?;
+        Ok(())
+    }
+}
+
+pub(crate) struct ChunkSlab {
+    slab: Slab,
+    index: usize,
+    object_offset: u64,
+}
+
+const INITIAL_CHUNK_SIZE: usize = 1 << 15; // 32 KiB
+const MAX_CHUNK_SIZE: usize = 1 << 20; // 1 MiB
+#[cfg(feature = "fs")]
+const WRITE_BUFFER_BYTES: usize = 4 << 20; // 4 MiB
+
+/// Iterator-like state for splitting slabs into chunks. The chunk size starts
+/// at [`INITIAL_CHUNK_SIZE`] for a fast first byte and doubles per chunk up to
+/// [`MAX_CHUNK_SIZE`], so a long transfer settles into large reads without
+/// paying that latency up front.
+pub(crate) struct ChunkIter {
+    slabs: Vec<Slab>,
+    slab_idx: usize,
+    offset: u64,
+    object_offset: u64,
+    remaining: u64,
+    chunk_size: usize,
+}
+
+impl ChunkIter {
+    pub(crate) fn new(slabs: Vec<Slab>, offset: u64, length: u64) -> Self {
+        // the absolute offset into the object's logical stream, before the
+        // walk below consumes `offset` down to a within-slab remainder.
+        let object_offset = offset;
+        let mut slab_idx = 0;
+        let mut offset = offset;
+        while slab_idx < slabs.len() {
+            let slab_length = slabs[slab_idx].length as u64;
+            if offset < slab_length {
+                break;
+            }
+            offset -= slab_length;
+            slab_idx += 1;
+        }
+        Self {
+            slabs,
+            slab_idx,
+            offset,
+            object_offset,
+            remaining: length,
+            chunk_size: INITIAL_CHUNK_SIZE,
+        }
+    }
+}
+
+impl Iterator for ChunkIter {
+    type Item = ChunkSlab;
+
+    fn next(&mut self) -> Option<ChunkSlab> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let slab_index = self.slab_idx;
+        let slab = &self.slabs[slab_index];
+        let object_offset = self.object_offset;
+        let slab_offset = slab.offset as u64 + self.offset;
+        let slab_length = (slab.length as u64 - self.offset)
+            .min(self.remaining)
+            .min(self.chunk_size as u64);
+        self.offset += slab_length;
+        self.object_offset += slab_length;
+
+        if self.offset >= slab.length as u64 {
+            self.offset = 0;
+            self.slab_idx += 1;
+        }
+        self.remaining -= slab_length;
+        self.chunk_size = self.chunk_size.saturating_mul(2).min(MAX_CHUNK_SIZE);
+
+        let mut chunk = slab.clone();
+        chunk.offset = slab_offset as u32;
+        chunk.length = slab_length as u32;
+        Some(ChunkSlab {
+            slab: chunk,
+            index: slab_index,
+            object_offset,
+        })
+    }
+}
+
+/// Downloads an object by recovering chunks of each slab in parallel and
+/// writing them to the output writer in order.
+///
+/// note: this is pulled out for now to enable easier testing. In the future, when
+/// we can mock the SDK, this should be moved directly into the Download method.
+/// Initial per-chunk size. Kept small so the first chunk — and therefore the
+/// first byte — lands in roughly one round trip.
+pub struct Download {
+    hosts: Hosts,
+    tokens: AccountTokenSource,
+    data_key: EncryptionKey,
+
+    // download state
+    controller: Arc<InflightController>,
+    buf: Bytes,
+    queue: VecDeque<AbortOnDropHandle<Result<Vec<u8>, DownloadError>>>,
+    chunk_iter: ChunkIter,
+    /// Sequence number assigned to the next spawned chunk.
+    next_seq: usize,
+    /// Number of chunks handed to the reader so far. Chunk tasks watch this
+    /// to decide whether they are within [`RACE_WINDOW`] of the read head.
+    popped: watch::Sender<usize>,
+    // sticky error
+    //
+    // note: in Go we would store the error and return it, but that would
+    // require all the enum variants to be Clone which is not the case, so
+    // a generic variant is returned after the first error.
+    errored: bool,
+
+    shard_downloaded: Option<ShardProgressCallback>,
+}
+
+impl AsyncRead for Download {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.errored {
+            return Poll::Ready(Err(std::io::Error::other(DownloadError::Errored)));
+        }
+
+        if !self.buf.is_empty() {
+            self.drain_buf(buf);
+            return Poll::Ready(Ok(()));
+        }
+
+        if let Some(chunk_handle) = self.queue.front_mut() {
+            let result = match ready!(Pin::new(chunk_handle).poll(cx)) {
+                Ok(Ok(data)) => data,
+                Ok(Err(e)) => {
+                    self.set_err();
+                    return Poll::Ready(Err(std::io::Error::other(e)));
+                }
+                Err(e) => {
+                    self.set_err();
+                    return Poll::Ready(Err(std::io::Error::other(e)));
+                }
+            };
+            self.queue.pop_front();
+            self.popped.send_modify(|p| *p += 1);
+            self.refill();
+            self.buf = Bytes::from(result);
+            self.drain_buf(buf);
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl Download {
+    fn drain_buf(&mut self, buf: &mut tokio::io::ReadBuf<'_>) {
+        let to_copy = std::cmp::min(buf.remaining(), self.buf.len());
+        buf.put_slice(&self.buf[..to_copy]);
+        self.buf.advance(to_copy);
+    }
+
+    /// Marks the download as errored and aborts all in-flight chunk tasks.
+    /// Subsequent reads will return [DownloadError::Errored].
+    fn set_err(&mut self) {
+        self.errored = true;
+        self.buf = Bytes::new();
+        self.queue.clear();
+    }
+
+    /// Spawns the next chunk recovery. Returns `false` once the chunk iterator
+    /// is exhausted.
+    fn spawn_next(&mut self) -> bool {
+        let Some(chunk_slab) = self.chunk_iter.next() else {
+            return false;
+        };
+        let hosts = self.hosts.clone();
+        let tokens = self.tokens.clone();
+        let shard_progress_callback = self.shard_downloaded.clone();
+        // Build the SlabRecovery synchronously so prioritization and top-K
+        // inflight reservations land before this method returns; each
+        // successive spawn must see the previous chunk's reservations to
+        // disperse picks across hosts.
+        let len = chunk_slab.slab.length as usize;
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let mut cipher = match chunk_slab.slab.version {
+            V0 => Chacha20Cipher::new_v0(self.data_key.clone(), chunk_slab.object_offset),
+            V1 => Chacha20Cipher::new_v1(
+                self.data_key.clone(),
+                chunk_slab.slab.offset as u64,
+                &chunk_slab.slab.encryption_key,
+            ),
+        };
+        // The limit counts chunks, so a chunk is what gets sampled: goodput then
+        // reads as chunks over chunk latency, the rate the download progresses at.
+        let controller = self.controller.clone();
+        let permit = controller.sample();
+        let recovery = SlabRecovery::new(
+            hosts,
+            self.controller.clone(),
+            tokens,
+            permit,
+            chunk_slab,
+            seq,
+            self.popped.clone(),
+        );
+        self.queue
+            .push_back(AbortOnDropHandle::new(maybe_spawn!(async move {
+                let started = Instant::now();
+                let recovered = async move {
+                    let recovery = recovery?;
+                    let mut buf = Vec::with_capacity(len);
+                    let decoded = recovery
+                        .recover_shards(shard_progress_callback)
+                        .await?
+                        .decode()?;
+                    let elapsed = decoded.slowest_winner();
+                    decoded.write(&mut buf).await?;
+                    cipher.apply_keystream(&mut buf);
+                    Ok::<_, DownloadError>((buf, elapsed))
+                }
+                .await;
+                // A failed chunk has no winner to time so we fall back to the
+                // overall duration.
+                let elapsed = recovered
+                    .as_ref()
+                    .map(|(_, d)| d.unwrap_or(started.elapsed()))
+                    .unwrap_or_default();
+                controller.record(permit, elapsed, recovered.is_ok());
+                recovered.map(|(buf, _)| buf)
+            })));
+        true
+    }
+
+    /// Tops the chunk queue up to the controller's current limit (bounded by
+    /// the memory budget), spawning chunks as the reader drains them.
+    fn refill(&mut self) {
+        while self.queue.len() < self.controller.limit() {
+            if !self.spawn_next() {
+                break;
+            }
+        }
+    }
+
+    /// Writes the whole download to the file at `path`, creating or truncating
+    /// it, and returns the number of bytes written.
+    #[cfg(feature = "fs")]
+    pub async fn write_to_path<P: AsRef<std::path::Path>>(
+        &mut self,
+        path: P,
+    ) -> Result<u64, DownloadError> {
+        let file = tokio::fs::File::create(path).await?;
+        // buffer the writes since copy moves 8 KiB at a time and every
+        // tokio::fs write is a hop to the blocking pool
+        let mut writer = tokio::io::BufWriter::with_capacity(WRITE_BUFFER_BYTES, file);
+        // the AsyncRead impl boxes the download error in an io::Error; unwrap
+        // it so callers still get the variant
+        tokio::io::copy(self, &mut writer).await.map_err(|e| {
+            e.downcast::<DownloadError>()
+                .unwrap_or_else(DownloadError::Io)
+        })
+    }
+
+    /// Returns the next decoded chunk of data. Returns an empty `Vec` on EOF.
+    /// Chunks are up to [`MAX_CHUNK_SIZE`].
+    ///
+    /// This is primarily intended for FFI bindings to enable zero-copy
+    /// transfer of an owned `Vec<u8>`. For general use, prefer the
+    /// [AsyncRead] implementation.
+    #[doc(hidden)]
+    pub async fn read_chunk(&mut self) -> Result<Vec<u8>, DownloadError> {
+        if self.errored {
+            return Err(DownloadError::Errored);
+        }
+        // If a previous AsyncRead poll left a partial buffer, drain it first
+        // so callers mixing read_chunk and poll_read don't lose data.
+        if !self.buf.is_empty() {
+            return Ok(std::mem::take(&mut self.buf).to_vec());
+        }
+        let Some(chunk_handle) = self.queue.pop_front() else {
+            return Ok(Vec::new()); // EOF
+        };
+        let result = match chunk_handle.await {
+            Ok(Ok(data)) => data,
+            Ok(Err(e)) => {
+                self.set_err();
+                return Err(e);
+            }
+            Err(e) => {
+                self.set_err();
+                return Err(e.into());
+            }
+        };
+        // Counted once the chunk is in hand, as in `poll_read`, so the next
+        // chunk is not promoted to the read head while this one is in flight.
+        self.popped.send_modify(|p| *p += 1);
+        self.refill();
+        Ok(result)
+    }
+
+    pub(crate) fn new<T: Into<AccountTokenSource>>(
+        object: &Object,
+        hosts: Hosts,
+        tokens: T,
+        options: DownloadOptions,
+    ) -> Result<Self, DownloadError> {
+        if options.max_buffered_chunks == Some(0) {
+            return Err(DownloadError::Custom(
+                "max buffered chunks must be greater than 0".to_string(),
+            ));
+        }
+        let tokens = tokens.into();
+        let object_size = object.size();
+        let data_key = object.data_key.clone();
+        let available = object_size.saturating_sub(options.offset);
+        let remaining = options.length.unwrap_or(available).min(available);
+        let slabs = object.slabs().to_vec();
+        // one chunk dispatched per unit of limit, and a chunk is the sample
+        let scale = 1;
+        let max_buffered_chunks = options
+            .max_buffered_chunks
+            .unwrap_or_else(default_chunks_in_memory);
+        let controller = Arc::new(InflightController::new(
+            INITIAL_INFLIGHT,
+            MIN_INFLIGHT,
+            max_buffered_chunks,
+            scale,
+        ));
+        let chunk_iter = ChunkIter::new(slabs, options.offset, remaining);
+        let mut download = Self {
+            hosts,
+            tokens,
+            controller,
+            data_key,
+            buf: Bytes::new(),
+            queue: VecDeque::with_capacity(max_buffered_chunks),
+            chunk_iter,
+            next_seq: 0,
+            popped: watch::channel(0).0,
+            errored: false,
+            shard_downloaded: options.shard_downloaded,
+        };
+        download.refill();
+        Ok(download)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::io::Cursor;
+    use std::sync::Arc;
+
+    use bytes::BytesMut;
+    use rand::Rng;
+    use sia_core::rhp4::SECTOR_SIZE;
+    use sia_core::signing::PrivateKey;
+    use sia_core::types::v2::NetAddress;
+
+    use crate::hosts::Hosts;
+    use crate::rhp4::{Client, mock};
+    use crate::upload::upload_object;
+    use crate::{AppKey, Host, ShardProgress, UploadOptions};
+
+    #[sia_core_derive::cross_target_test]
+    async fn test_out_of_order_download() {
+        let upload_options = UploadOptions::default();
+        let optimal_data_size = upload_options.data_shards as usize * SECTOR_SIZE;
+
+        let transport = mock::Client::new();
+        let hosts = Hosts::new(Client::Mock(transport.clone()));
+        hosts.update(
+            (0..60)
+                .map(|_| Host {
+                    public_key: PrivateKey::from_seed(&rand::random()).public_key(),
+                    addresses: vec![NetAddress {
+                        protocol: sia_core::types::v2::Protocol::QUIC,
+                        address: "localhost:1234".to_string(),
+                    }],
+                    country_code: "US".to_string(),
+                    latitude: 0.0,
+                    longitude: 0.0,
+                    good_for_upload: true,
+                })
+                .collect(),
+            true,
+        );
+        let mut data = BytesMut::zeroed(optimal_data_size);
+        rand::rng().fill_bytes(&mut data);
+        let data = data.freeze();
+        let app_key = Arc::new(AppKey::import(rand::random()));
+
+        // configure decreasing per-sector read delays to force out-of-order
+        // chunk completion during download
+        transport.set_initial_read_delay(Duration::from_millis(500));
+
+        let obj = upload_object(
+            hosts.clone(),
+            crate::app_client::Client::mock(),
+            app_key.clone(),
+            Object::default(),
+            Cursor::new(data.clone()),
+            UploadOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let mut recovered_data = Vec::with_capacity(optimal_data_size);
+        let mut download = Download::new(
+            &obj,
+            hosts.clone(),
+            app_key.clone(),
+            DownloadOptions::default(),
+        )
+        .unwrap();
+        tokio::io::copy(&mut download, &mut recovered_data)
+            .await
+            .unwrap();
+
+        assert_eq!(data, recovered_data);
+    }
+
+    /// Regression: a V1 object (each slab encrypted with its own key used as
+    /// the cipher nonce over the object data key) must round-trip through the
+    /// full download reader, including a ranged read that crosses a slab
+    /// boundary so the per-slab nonce and slab-local seek are exercised.
+    #[sia_core_derive::cross_target_test]
+    async fn test_download_v1_object() {
+        let upload_options = UploadOptions::default();
+        let optimal_data_size = upload_options.data_shards as usize * SECTOR_SIZE;
+
+        let transport = mock::Client::new();
+        let hosts = Hosts::new(Client::Mock(transport.clone()));
+        hosts.update(
+            (0..60)
+                .map(|_| Host {
+                    public_key: PrivateKey::from_seed(&rand::random()).public_key(),
+                    addresses: vec![NetAddress {
+                        protocol: sia_core::types::v2::Protocol::QUIC,
+                        address: "localhost:1234".to_string(),
+                    }],
+                    country_code: "US".to_string(),
+                    latitude: 0.0,
+                    longitude: 0.0,
+                    good_for_upload: true,
+                })
+                .collect(),
+            true,
+        );
+
+        // a full slab plus a partial one, so the download spans a slab boundary
+        let mut data = BytesMut::zeroed(optimal_data_size + 4096);
+        rand::rng().fill_bytes(&mut data);
+        let data = data.freeze();
+        let app_key = Arc::new(AppKey::import(rand::random()));
+
+        let obj = upload_object(
+            hosts.clone(),
+            crate::app_client::Client::mock(),
+            app_key.clone(),
+            Object::default(),
+            Cursor::new(data.clone()),
+            upload_options,
+        )
+        .await
+        .unwrap();
+
+        // guard: exercise the V1 path, not V0
+        assert!(
+            obj.slabs().iter().all(|s| s.version == V1),
+            "expected V1 slabs, got {:?}",
+            obj.slabs().iter().map(|s| s.version).collect::<Vec<_>>()
+        );
+
+        let mut recovered = Vec::with_capacity(data.len());
+        let mut download = Download::new(
+            &obj,
+            hosts.clone(),
+            app_key.clone(),
+            DownloadOptions::default(),
+        )
+        .unwrap();
+        tokio::io::copy(&mut download, &mut recovered)
+            .await
+            .unwrap();
+        assert_eq!(data, recovered, "full V1 download mismatch");
+
+        // ranged read across a slab boundary, exercising the V1 slab-local seek
+        let offset = optimal_data_size - 1000;
+        let length = 2000;
+        let mut ranged = Vec::with_capacity(length);
+        let mut download = Download::new(
+            &obj,
+            hosts.clone(),
+            app_key.clone(),
+            DownloadOptions {
+                offset: offset as u64,
+                length: Some(length as u64),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        tokio::io::copy(&mut download, &mut ranged).await.unwrap();
+        assert_eq!(
+            &data[offset..offset + length],
+            &ranged[..],
+            "ranged V1 download mismatch"
+        );
+    }
+
+    #[sia_core_derive::cross_target_test]
+    async fn test_download_v0_object() {
+        let upload_options = UploadOptions::default();
+        let data_shards = upload_options.data_shards as usize;
+        let parity_shards = upload_options.parity_shards as usize;
+        let total_shards = data_shards + parity_shards;
+
+        let transport = mock::Client::new();
+        let hosts = Hosts::new(Client::Mock(transport.clone()));
+        let host_keys: Vec<_> = (0..total_shards)
+            .map(|_| PrivateKey::from_seed(&rand::random()).public_key())
+            .collect();
+        hosts.update(
+            host_keys
+                .iter()
+                .map(|&public_key| Host {
+                    public_key,
+                    addresses: vec![NetAddress {
+                        protocol: sia_core::types::v2::Protocol::QUIC,
+                        address: "localhost:1234".to_string(),
+                    }],
+                    country_code: "US".to_string(),
+                    latitude: 0.0,
+                    longitude: 0.0,
+                    good_for_upload: true,
+                })
+                .collect(),
+            true,
+        );
+
+        let mut plaintext = vec![0u8; 100_000];
+        rand::rng().fill_bytes(&mut plaintext);
+        let app_key = Arc::new(AppKey::import(rand::random()));
+        let data_key: EncryptionKey = rand::random::<[u8; 32]>().into();
+        let slab_key: EncryptionKey = rand::random::<[u8; 32]>().into();
+
+        // V0 layer: one stream cipher over the whole object, keyed by the data key
+        let mut stream = plaintext.clone();
+        Chacha20Cipher::new_v0(data_key.clone(), 0).apply_keystream(&mut stream);
+
+        let mut shards = vec![vec![0u8; SECTOR_SIZE]; total_shards];
+        let stripe = SEGMENT_SIZE * data_shards;
+        for (p, &b) in stream.iter().enumerate() {
+            let shard = (p % stripe) / SEGMENT_SIZE;
+            let seg_start = (p / stripe) * SEGMENT_SIZE;
+            shards[shard][seg_start + (p % SEGMENT_SIZE)] = b;
+        }
+        ErasureCoder::new(data_shards, parity_shards)
+            .unwrap()
+            .encode_shards(&mut shards)
+            .unwrap();
+
+        let mut sectors = Vec::with_capacity(total_shards);
+        for (i, mut shard) in shards.into_iter().enumerate() {
+            crate::encryption::encrypt_shard(&slab_key, i as u8, 0, &mut shard);
+            let root = hosts
+                .write_sector(
+                    host_keys[i],
+                    &app_key.0,
+                    Bytes::from(shard),
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+            sectors.push(Sector {
+                root,
+                host_key: host_keys[i],
+            });
+        }
+
+        let obj = Object {
+            data_key,
+            slabs: vec![Slab {
+                version: V0,
+                encryption_key: slab_key,
+                min_shards: data_shards as u8,
+                sectors,
+                offset: 0,
+                length: plaintext.len() as u32,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(obj.slabs()[0].version, V0);
+
+        let mut recovered = Vec::with_capacity(plaintext.len());
+        let mut download = Download::new(
+            &obj,
+            hosts.clone(),
+            app_key.clone(),
+            DownloadOptions::default(),
+        )
+        .unwrap();
+        tokio::io::copy(&mut download, &mut recovered)
+            .await
+            .unwrap();
+        assert_eq!(plaintext, recovered, "full V0 download mismatch");
+
+        let (offset, length) = (40_000usize, 20_000usize);
+        let mut ranged = Vec::with_capacity(length);
+        let mut download = Download::new(
+            &obj,
+            hosts.clone(),
+            app_key.clone(),
+            DownloadOptions {
+                offset: offset as u64,
+                length: Some(length as u64),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        tokio::io::copy(&mut download, &mut ranged).await.unwrap();
+        assert_eq!(
+            &plaintext[offset..offset + length],
+            &ranged[..],
+            "ranged V0 download mismatch"
+        );
+    }
+
+    #[sia_core_derive::cross_target_test]
+    async fn test_slab_recovery() {
+        let upload_options = UploadOptions::default();
+        let optimal_data_size = upload_options.data_shards as usize * SECTOR_SIZE;
+
+        let transport = mock::Client::new();
+        let hosts = Hosts::new(Client::Mock(transport.clone()));
+        hosts.update(
+            (0..60)
+                .map(|_| Host {
+                    public_key: PrivateKey::from_seed(&rand::random()).public_key(),
+                    addresses: vec![NetAddress {
+                        protocol: sia_core::types::v2::Protocol::QUIC,
+                        address: "localhost:1234".to_string(),
+                    }],
+                    country_code: "US".to_string(),
+                    latitude: 0.0,
+                    longitude: 0.0,
+                    good_for_upload: true,
+                })
+                .collect(),
+            true,
+        );
+        let mut data = BytesMut::zeroed(optimal_data_size);
+        rand::rng().fill_bytes(&mut data);
+        let data = data.freeze();
+        let app_key = Arc::new(AppKey::import(rand::random()));
+
+        let obj = upload_object(
+            hosts.clone(),
+            crate::app_client::Client::mock(),
+            app_key.clone(),
+            Object::default(),
+            Cursor::new(data.clone()),
+            upload_options,
+        )
+        .await
+        .unwrap();
+        let slabs = obj.slabs();
+
+        let test_cases: Vec<(&str, usize, usize)> = vec![
+            ("full slab", 0, optimal_data_size),
+            ("first half", 0, optimal_data_size / 2),
+            ("second half", optimal_data_size / 2, optimal_data_size / 2),
+            ("first 30 bytes", 0, 30),
+            ("middle 30 bytes", optimal_data_size / 2 - 15, 30),
+            ("last 30 bytes", optimal_data_size - 30, 30),
+            ("first 4KiB", 0, 4096),
+            ("middle 4KiB", optimal_data_size / 2 - 2048, 4096),
+            ("last 4KiB", optimal_data_size - 4096, 4096),
+        ];
+
+        for (name, offset, length) in test_cases {
+            let mut slab = slabs[0].clone();
+            slab.offset = offset as u32;
+            slab.length = length as u32;
+
+            let mut recovered_data = Vec::with_capacity(length);
+            let controller = Arc::new(InflightController::new(
+                INITIAL_INFLIGHT,
+                MIN_INFLIGHT,
+                100,
+                10,
+            ));
+            let permit = controller.sample();
+            SlabRecovery::new(
+                hosts.clone(),
+                controller,
+                app_key.clone(),
+                permit,
+                ChunkSlab {
+                    slab,
+                    index: 0,
+                    object_offset: offset as u64,
+                },
+                0,
+                watch::channel(0).0,
+            )
+            .unwrap()
+            .recover_shards(None)
+            .await
+            .unwrap()
+            .decode()
+            .unwrap()
+            .write(&mut recovered_data)
+            .await
+            .unwrap();
+            // SlabRecovery only strips the per-shard layer; remove the object
+            // data-key layer here.
+            Chacha20Cipher::new_v1(
+                obj.data_key.clone(),
+                offset as u64,
+                &slabs[0].encryption_key,
+            )
+            .apply_keystream(&mut recovered_data);
+            assert_eq!(
+                &data[offset..offset + length],
+                &recovered_data[..],
+                "mismatch for case: {name}"
+            );
+        }
+    }
+
+    #[sia_core_derive::cross_target_test]
+    async fn test_download_retries_failed_shards() {
+        let upload_options = UploadOptions::default();
+        let optimal_data_size = upload_options.data_shards as usize * SECTOR_SIZE;
+
+        let transport = mock::Client::new();
+        let hosts = Hosts::new(Client::Mock(transport.clone()));
+        hosts.update(
+            (0..60)
+                .map(|_| Host {
+                    public_key: PrivateKey::from_seed(&rand::random()).public_key(),
+                    addresses: vec![NetAddress {
+                        protocol: sia_core::types::v2::Protocol::QUIC,
+                        address: "localhost:1234".to_string(),
+                    }],
+                    country_code: "US".to_string(),
+                    latitude: 0.0,
+                    longitude: 0.0,
+                    good_for_upload: true,
+                })
+                .collect(),
+            true,
+        );
+        let mut data = BytesMut::zeroed(optimal_data_size);
+        rand::rng().fill_bytes(&mut data);
+        let data = data.freeze();
+        let app_key = Arc::new(AppKey::import(rand::random()));
+
+        let obj = upload_object(
+            hosts.clone(),
+            crate::app_client::Client::mock(),
+            app_key.clone(),
+            Object::default(),
+            Cursor::new(data.clone()),
+            upload_options,
+        )
+        .await
+        .unwrap();
+        transport.set_read_failures(obj.slabs()[0].sectors.iter().map(|s| s.host_key), 1);
+
+        let mut recovered_data = Vec::with_capacity(optimal_data_size);
+        let mut download = Download::new(
+            &obj,
+            hosts.clone(),
+            app_key.clone(),
+            DownloadOptions {
+                max_buffered_chunks: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        tokio::io::copy(&mut download, &mut recovered_data)
+            .await
+            .unwrap();
+        assert_eq!(data, recovered_data);
+    }
+
+    /// `write_to_path` drives the [AsyncRead] impl, which erases the download
+    /// error into an `io::Error`. Callers still need the variant.
+    #[cfg(feature = "fs")]
+    #[tokio::test]
+    async fn test_download_write_to_path_reports_download_error() {
+        let upload_options = UploadOptions::default();
+        let optimal_data_size = upload_options.data_shards as usize * SECTOR_SIZE;
+
+        let transport = mock::Client::new();
+        let hosts = Hosts::new(Client::Mock(transport.clone()));
+        hosts.update(
+            (0..60)
+                .map(|_| Host {
+                    public_key: PrivateKey::from_seed(&rand::random()).public_key(),
+                    addresses: vec![NetAddress {
+                        protocol: sia_core::types::v2::Protocol::QUIC,
+                        address: "localhost:1234".to_string(),
+                    }],
+                    country_code: "US".to_string(),
+                    latitude: 0.0,
+                    longitude: 0.0,
+                    good_for_upload: true,
+                })
+                .collect(),
+            true,
+        );
+        let mut data = BytesMut::zeroed(optimal_data_size);
+        rand::rng().fill_bytes(&mut data);
+        let data = data.freeze();
+        let app_key = Arc::new(AppKey::import(rand::random()));
+
+        let obj = upload_object(
+            hosts.clone(),
+            crate::app_client::Client::mock(),
+            app_key.clone(),
+            Object::default(),
+            Cursor::new(data.clone()),
+            upload_options,
+        )
+        .await
+        .unwrap();
+        // every read from the slab's hosts fails, so no recovery reaches
+        // min_shards however many times it retries
+        transport.set_read_failures(
+            obj.slabs()[0].sectors.iter().map(|s| s.host_key),
+            usize::MAX,
+        );
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut download = Download::new(
+            &obj,
+            hosts.clone(),
+            app_key.clone(),
+            DownloadOptions::default(),
+        )
+        .unwrap();
+        let err = download
+            .write_to_path(dir.path().join("object.bin"))
+            .await
+            .expect_err("download to fail");
+        assert!(
+            matches!(err, DownloadError::NotEnoughShards(..)),
+            "expected NotEnoughShards, got {err:?}"
+        );
+    }
+
+    /// A sector whose host this SDK has no address for can never be read, so
+    /// the shortage is known before a single attempt. Without the drop in
+    /// `prioritize` those sectors stay in the queue and the same failure only
+    /// surfaces per sector, after a run of doomed reads.
+    #[sia_core_derive::cross_target_test]
+    async fn test_recovery_fails_immediately_when_hosts_are_unreachable() {
+        let (hosts, app_key, slab, _) =
+            racing_setup(Duration::from_millis(0), Duration::from_micros(1)).await;
+        let min_shards = slab.min_shards as usize;
+
+        // Every host the slab was written to is now gone from the SDK, so none
+        // of its sectors has an address to dial.
+        hosts.update(Vec::new(), true);
+
+        let controller = Arc::new(InflightController::new(
+            INITIAL_INFLIGHT,
+            MIN_INFLIGHT,
+            100,
+            10,
+        ));
+        let permit = controller.sample();
+        let err = SlabRecovery::new(
+            hosts.clone(),
+            controller,
+            app_key.clone(),
+            permit,
+            racing_chunk(&slab),
+            RACE_WINDOW,
+            watch::channel(0).0,
+        )
+        .err()
+        .expect("unreachable hosts should fail before any read");
+        match err {
+            DownloadError::NotEnoughShards(have, need) => {
+                assert_eq!(have, 0, "no sector had a reachable host");
+                assert_eq!(need, min_shards);
+            }
+            e => panic!("expected NotEnoughShards, got {e:?}"),
+        }
+    }
+
+    #[sia_core_derive::cross_target_test]
+    async fn test_slab_recovery_progress_callback() {
+        let upload_options = UploadOptions::default();
+        let min_shards = upload_options.data_shards as usize;
+        let total_shards = min_shards + upload_options.parity_shards as usize;
+        let optimal_data_size = upload_options.optimal_data_size();
+        let num_slabs = 3;
+
+        let transport = mock::Client::new();
+        let hosts = Hosts::new(Client::Mock(transport.clone()));
+        hosts.update(
+            (0..60)
+                .map(|_| Host {
+                    public_key: PrivateKey::from_seed(&rand::random()).public_key(),
+                    addresses: vec![NetAddress {
+                        protocol: sia_core::types::v2::Protocol::QUIC,
+                        address: "localhost:1234".to_string(),
+                    }],
+                    country_code: "US".to_string(),
+                    latitude: 0.0,
+                    longitude: 0.0,
+                    good_for_upload: true,
+                })
+                .collect(),
+            true,
+        );
+        // upload enough data for multiple slabs
+        let data_size = optimal_data_size * num_slabs;
+        let mut data = BytesMut::zeroed(data_size);
+        rand::rng().fill_bytes(&mut data);
+        let data = data.freeze();
+        let app_key = Arc::new(AppKey::import(rand::random()));
+
+        let obj = upload_object(
+            hosts.clone(),
+            crate::app_client::Client::mock(),
+            app_key.clone(),
+            Object::default(),
+            Cursor::new(data.clone()),
+            upload_options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(obj.slabs().len(), num_slabs);
+
+        // download with progress callback
+        let progress: Arc<std::sync::Mutex<Vec<ShardProgress>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let progress_clone = progress.clone();
+        let opts = DownloadOptions::default().on_shard_downloaded(move |p: ShardProgress| {
+            progress_clone.lock().unwrap().push(p);
+        });
+
+        let mut recovered_data = Vec::with_capacity(data_size);
+        let mut download = Download::new(&obj, hosts.clone(), app_key.clone(), opts).unwrap();
+        tokio::io::copy(&mut download, &mut recovered_data)
+            .await
+            .unwrap();
+        assert_eq!(data, recovered_data);
+
+        let events = progress.lock().unwrap();
+        // the chunk size ramps, so chunks per slab isn't uniform; replay the
+        // same iterator the downloader uses to count them. each chunk recovers
+        // min_shards shards independently.
+        let total_chunks = ChunkIter::new(obj.slabs().to_vec(), 0, data_size as u64).count();
+        let expected_total = total_chunks * min_shards;
+        assert_eq!(
+            events.len(),
+            expected_total,
+            "expected {expected_total} progress callbacks ({total_chunks} chunks × {min_shards} shards), got {}",
+            events.len()
+        );
+
+        // count callbacks per slab, verify shard metadata
+        let mut per_slab: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+        for event in events.iter() {
+            assert!(
+                event.shard_size > 0 && event.shard_size <= SECTOR_SIZE,
+                "shard_size {} out of range",
+                event.shard_size
+            );
+            assert!(
+                event.shard_index < total_shards,
+                "shard_index {} out of range for total_shards {}",
+                event.shard_index,
+                total_shards
+            );
+            *per_slab.entry(event.slab_index).or_default() += 1;
+        }
+        // every slab should have at least one callback
+        for slab_idx in 0..num_slabs {
+            assert!(
+                per_slab.contains_key(&slab_idx),
+                "slab {slab_idx} had no progress callbacks"
+            );
+        }
+    }
+
+    /// Uploads one slab to 60 hosts and makes its first 15 sector hosts
+    /// answer after `slow_delay`. Every other host gets a failure sample so
+    /// `prioritize` picks the slow hosts first and racers come from the fast
+    /// ones. The slow hosts get a read sample of 256 KiB in `sample`, which
+    /// sets the read estimate the race timeout derives from.
+    async fn racing_setup(
+        slow_delay: Duration,
+        sample: Duration,
+    ) -> (Hosts, Arc<AppKey>, Slab, mock::Client) {
+        let upload_options = UploadOptions::default();
+        let optimal_data_size = upload_options.data_shards as usize * SECTOR_SIZE;
+
+        let transport = mock::Client::new();
+        let hosts = Hosts::new(Client::Mock(transport.clone()));
+        hosts.update(
+            (0..60)
+                .map(|_| Host {
+                    public_key: PrivateKey::from_seed(&rand::random()).public_key(),
+                    addresses: vec![NetAddress {
+                        protocol: sia_core::types::v2::Protocol::QUIC,
+                        address: "localhost:1234".to_string(),
+                    }],
+                    country_code: "US".to_string(),
+                    latitude: 0.0,
+                    longitude: 0.0,
+                    good_for_upload: true,
+                })
+                .collect(),
+            true,
+        );
+        let mut data = BytesMut::zeroed(optimal_data_size);
+        rand::rng().fill_bytes(&mut data);
+        let data = data.freeze();
+        let app_key = Arc::new(AppKey::import(rand::random()));
+
+        let obj = upload_object(
+            hosts.clone(),
+            crate::app_client::Client::mock(),
+            app_key.clone(),
+            Object::default(),
+            Cursor::new(data),
+            upload_options,
+        )
+        .await
+        .unwrap();
+        let slab = obj.slabs()[0].clone();
+
+        let slow_set: Vec<_> = slab.sectors.iter().take(15).map(|s| s.host_key).collect();
+        for sector in slab.sectors.iter().skip(15) {
+            hosts.add_failure(sector.host_key);
+        }
+        for host_key in &slow_set {
+            hosts.record_read_sample(*host_key, 1 << 18, sample);
+        }
+        transport.set_slow_hosts(slow_set, slow_delay);
+        (hosts, app_key, slab, transport)
+    }
+
+    fn racing_chunk(slab: &Slab) -> ChunkSlab {
+        let mut chunk = slab.clone();
+        chunk.offset = 0;
+        chunk.length = 1 << 18;
+        ChunkSlab {
+            slab: chunk,
+            index: 0,
+            object_offset: 0,
+        }
+    }
+
+    #[sia_core_derive::cross_target_test]
+    async fn test_download_race_gated_outside_window() {
+        let (hosts, app_key, slab, transport) =
+            racing_setup(Duration::from_millis(1500), Duration::from_micros(1)).await;
+        let start = Instant::now();
+        let controller = Arc::new(InflightController::new(
+            INITIAL_INFLIGHT,
+            MIN_INFLIGHT,
+            100,
+            10,
+        ));
+        let permit = controller.sample();
+        SlabRecovery::new(
+            hosts.clone(),
+            controller,
+            app_key.clone(),
+            permit,
+            racing_chunk(&slab),
+            RACE_WINDOW, // first chunk outside the window
+            watch::channel(0).0,
+        )
+        .unwrap()
+        .recover_shards(None)
+        .await
+        .unwrap();
+        assert!(
+            start.elapsed() >= Duration::from_millis(1200),
+            "chunk outside the window must not race: {:?}",
+            start.elapsed()
+        );
+        assert_eq!(
+            transport.read_requests(),
+            slab.min_shards as usize * 3 / 2,
+            "a chunk outside the window reads only the overprovisioned set"
+        );
+    }
+
+    #[sia_core_derive::cross_target_test]
+    async fn test_download_race_within_window() {
+        let (hosts, app_key, slab, _) =
+            racing_setup(Duration::from_millis(1500), Duration::from_micros(1)).await;
+        let start = Instant::now();
+        let controller = Arc::new(InflightController::new(
+            INITIAL_INFLIGHT,
+            MIN_INFLIGHT,
+            100,
+            10,
+        ));
+        let permit = controller.sample();
+        SlabRecovery::new(
+            hosts.clone(),
+            controller,
+            app_key.clone(),
+            permit,
+            racing_chunk(&slab),
+            1, // one chunk ahead of the reader: in the window, not the head
+            watch::channel(0).0,
+        )
+        .unwrap()
+        .recover_shards(None)
+        .await
+        .unwrap();
+        assert!(
+            start.elapsed() < Duration::from_millis(1200),
+            "chunk within the window should race slow hosts: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// The chunk the reader is waiting on reads every sector up front instead
+    /// of racing slow hosts in one at a time.
+    #[sia_core_derive::cross_target_test]
+    async fn test_download_head_chunk_reads_every_host() {
+        let (hosts, app_key, slab, transport) =
+            racing_setup(Duration::from_millis(1500), Duration::from_micros(1)).await;
+        let start = Instant::now();
+        let controller = Arc::new(InflightController::new(
+            INITIAL_INFLIGHT,
+            MIN_INFLIGHT,
+            100,
+            10,
+        ));
+        let permit = controller.sample();
+        SlabRecovery::new(
+            hosts.clone(),
+            controller,
+            app_key.clone(),
+            permit,
+            racing_chunk(&slab),
+            0,
+            watch::channel(0).0,
+        )
+        .unwrap()
+        .recover_shards(None)
+        .await
+        .unwrap();
+        assert!(
+            start.elapsed() < Duration::from_millis(1200),
+            "the head chunk must not wait on slow hosts: {:?}",
+            start.elapsed()
+        );
+        assert_eq!(
+            transport.read_requests(),
+            slab.sectors.len(),
+            "the head chunk reads every sector at once"
+        );
+    }
+
+    #[sia_core_derive::cross_target_test]
+    async fn test_download_race_triggered_by_window() {
+        let (hosts, app_key, slab, _) =
+            racing_setup(Duration::from_millis(1500), Duration::from_micros(1)).await;
+        let popped_tx = watch::channel(0).0;
+        // the reader pops a chunk 200ms in, bringing this chunk into the
+        // window; racing should begin immediately rather than waiting
+        // another race-timeout interval
+        let tx = popped_tx.clone();
+        maybe_spawn!(async move {
+            sleep(Duration::from_millis(200)).await;
+            tx.send_modify(|p| *p += 1);
+        });
+        let start = Instant::now();
+        let controller = Arc::new(InflightController::new(
+            INITIAL_INFLIGHT,
+            MIN_INFLIGHT,
+            100,
+            10,
+        ));
+        let permit = controller.sample();
+        SlabRecovery::new(
+            hosts.clone(),
+            controller,
+            app_key.clone(),
+            permit,
+            racing_chunk(&slab),
+            RACE_WINDOW,
+            popped_tx,
+        )
+        .unwrap()
+        .recover_shards(None)
+        .await
+        .unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(190) && elapsed < Duration::from_millis(1200),
+            "racing should begin once the chunk enters the window: {elapsed:?}"
+        );
+    }
+
+    /// `read_chunk` must not count a chunk as popped until it has completed;
+    /// otherwise the chunk behind it is promoted to the read head and reads
+    /// every sector while the reader is still blocked on this one.
+    #[sia_core_derive::cross_target_test]
+    async fn test_read_chunk_pops_after_the_chunk_completes() {
+        let upload_options = UploadOptions::default();
+        let optimal_data_size = upload_options.data_shards as usize * SECTOR_SIZE;
+
+        let transport = mock::Client::new();
+        let hosts = Hosts::new(Client::Mock(transport.clone()));
+        let host_keys: Vec<_> = (0..60)
+            .map(|_| PrivateKey::from_seed(&rand::random()).public_key())
+            .collect();
+        hosts.update(
+            host_keys
+                .iter()
+                .map(|public_key| Host {
+                    public_key: *public_key,
+                    addresses: vec![NetAddress {
+                        protocol: sia_core::types::v2::Protocol::QUIC,
+                        address: "localhost:1234".to_string(),
+                    }],
+                    country_code: "US".to_string(),
+                    latitude: 0.0,
+                    longitude: 0.0,
+                    good_for_upload: true,
+                })
+                .collect(),
+            true,
+        );
+        let mut data = BytesMut::zeroed(optimal_data_size);
+        rand::rng().fill_bytes(&mut data);
+        let app_key = Arc::new(AppKey::import(rand::random()));
+        let obj = upload_object(
+            hosts.clone(),
+            crate::app_client::Client::mock(),
+            app_key.clone(),
+            Object::default(),
+            Cursor::new(data.freeze()),
+            upload_options,
+        )
+        .await
+        .unwrap();
+        // every host answers late, so the first chunk stays in flight
+        transport.set_slow_hosts(host_keys, Duration::from_millis(500));
+
+        let mut download = Download::new(
+            &obj,
+            hosts.clone(),
+            app_key.clone(),
+            DownloadOptions::default(),
+        )
+        .unwrap();
+        let popped = download.popped.subscribe();
+        let read = download.read_chunk();
+        tokio::pin!(read);
+        tokio::select! {
+            biased;
+            _ = sleep(Duration::from_millis(100)) => {},
+            _ = &mut read => panic!("the chunk completed before its hosts could answer"),
+        }
+        assert_eq!(
+            *popped.borrow(),
+            0,
+            "a chunk still in flight must not count as popped"
+        );
+        let chunk = read.await.unwrap();
+        assert!(!chunk.is_empty());
+        assert_eq!(*popped.borrow(), 1);
+    }
+
+    /// A chunk the reader catches up to races every remaining host at once
+    /// rather than waiting out the race timeout for each.
+    #[sia_core_derive::cross_target_test]
+    async fn test_download_head_transition_races_every_host() {
+        // 256 KiB in a second puts the race timeout at 1.5s, past the slow
+        // hosts, so only the head transition can finish this chunk early
+        let (hosts, app_key, slab, transport) =
+            racing_setup(Duration::from_millis(1500), Duration::from_secs(1)).await;
+        let popped_tx = watch::channel(0).0;
+        // the reader reaches this chunk 200ms in
+        let tx = popped_tx.clone();
+        maybe_spawn!(async move {
+            sleep(Duration::from_millis(200)).await;
+            tx.send_modify(|p| *p = RACE_WINDOW);
+        });
+        let start = Instant::now();
+        let controller = Arc::new(InflightController::new(
+            INITIAL_INFLIGHT,
+            MIN_INFLIGHT,
+            100,
+            10,
+        ));
+        let permit = controller.sample();
+        SlabRecovery::new(
+            hosts.clone(),
+            controller,
+            app_key.clone(),
+            permit,
+            racing_chunk(&slab),
+            RACE_WINDOW,
+            popped_tx,
+        )
+        .unwrap()
+        .recover_shards(None)
+        .await
+        .unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(190) && elapsed < Duration::from_millis(1200),
+            "reaching the head must race the remaining hosts immediately: {elapsed:?}"
+        );
+        assert_eq!(
+            transport.read_requests(),
+            slab.sectors.len(),
+            "the head transition reads every remaining sector"
+        );
+    }
+
+    /// Shard topology after `prioritize` drops sectors whose host the SDK no
+    /// longer knows (the indexer's usable list omits them, e.g. after it
+    /// blocked unusable hosts). Recovered shards must sit at their ORIGINAL
+    /// slab index in a vector of the slab's full shard count; the subset's
+    /// length is neither the index space nor the erasure-code shape.
+    mod shard_topology {
+        use super::*;
+        use sia_core::signing::PublicKey;
+
+        struct Fixture {
+            hosts: Hosts,
+            transport: mock::Client,
+            app_key: Arc<AppKey>,
+            all_hosts: Vec<Host>,
+            obj: Object,
+            data: Bytes,
+        }
+
+        impl Fixture {
+            /// One full slab in the production 10+20 layout on 30 of 60 mock hosts.
+            async fn new() -> Self {
+                let upload_options = UploadOptions::default();
+                assert_eq!((upload_options.data_shards, upload_options.parity_shards), (10, 20));
+                let optimal_data_size = upload_options.data_shards as usize * SECTOR_SIZE;
+                let transport = mock::Client::new();
+                let hosts = Hosts::new(Client::Mock(transport.clone()));
+                let all_hosts: Vec<Host> = (0..60)
+                    .map(|_| Host {
+                        public_key: PrivateKey::from_seed(&rand::random()).public_key(),
+                        addresses: vec![NetAddress {
+                            protocol: sia_core::types::v2::Protocol::QUIC,
+                            address: "localhost:1234".to_string(),
+                        }],
+                        country_code: "US".to_string(),
+                        latitude: 0.0,
+                        longitude: 0.0,
+                        good_for_upload: true,
+                    })
+                    .collect();
+                hosts.update(all_hosts.clone(), true);
+                let mut data = BytesMut::zeroed(optimal_data_size);
+                rand::rng().fill_bytes(&mut data);
+                let data = data.freeze();
+                let app_key = Arc::new(AppKey::import(rand::random()));
+                let obj = upload_object(
+                    hosts.clone(),
+                    crate::app_client::Client::mock(),
+                    app_key.clone(),
+                    Object::default(),
+                    Cursor::new(data.clone()),
+                    upload_options,
+                )
+                .await
+                .unwrap();
+                assert_eq!(obj.slabs().len(), 1);
+                assert_eq!(obj.slabs()[0].sectors.len(), 30);
+                Fixture { hosts, transport, app_key, all_hosts, obj, data }
+            }
+
+            fn slab(&self) -> Slab {
+                self.obj.slabs()[0].clone()
+            }
+
+            fn host_of(&self, shard: usize) -> PublicKey {
+                self.slab().sectors[shard].host_key
+            }
+
+            /// The SDK's host list becomes the full list minus the hosts of
+            /// `shards`, as `Hosts::refresh` replaces it with the indexer's.
+            fn forget(&self, shards: impl IntoIterator<Item = usize>) {
+                let gone: Vec<PublicKey> = shards.into_iter().map(|i| self.host_of(i)).collect();
+                self.hosts.update(
+                    self.all_hosts.iter().filter(|h| !gone.contains(&h.public_key)).cloned().collect(),
+                    true,
+                );
+            }
+
+            /// Every read of the hosts of `shards` fails (more often than a
+            /// sector is retried).
+            fn fail_reads(&self, shards: impl IntoIterator<Item = usize>) {
+                let keys: Vec<PublicKey> = shards.into_iter().map(|i| self.host_of(i)).collect();
+                self.transport.set_read_failures(keys, 100);
+            }
+
+            fn recovery(&self) -> Result<SlabRecovery<AwaitingRecovery>, DownloadError> {
+                let mut slab = self.slab();
+                slab.offset = 0;
+                slab.length = self.data.len() as u32;
+                let controller = Arc::new(InflightController::new(INITIAL_INFLIGHT, MIN_INFLIGHT, 100, 10));
+                let permit = controller.sample();
+                SlabRecovery::new(
+                    self.hosts.clone(),
+                    controller,
+                    self.app_key.clone(),
+                    permit,
+                    ChunkSlab { slab, index: 0, object_offset: 0 },
+                    0,
+                    watch::channel(0).0,
+                )
+            }
+
+            /// Recovers, decodes and decrypts the whole slab through `SlabRecovery`.
+            async fn recover(&self, recovery: SlabRecovery<AwaitingRecovery>) -> Result<Vec<u8>, DownloadError> {
+                let mut out = Vec::with_capacity(self.data.len());
+                recovery.recover_shards(None).await?.decode()?.write(&mut out).await?;
+                Chacha20Cipher::new_v1(self.obj.data_key.clone(), 0, &self.slab().encryption_key)
+                    .apply_keystream(&mut out);
+                Ok(out)
+            }
+
+            /// The whole object through the public `Download` reader (sia-s3's GET path).
+            async fn download(&self) -> Result<Vec<u8>, String> {
+                let mut out = Vec::with_capacity(self.data.len());
+                let mut download = Download::new(&self.obj, self.hosts.clone(), self.app_key.clone(), DownloadOptions::default())
+                    .map_err(|e| format!("{e:?}"))?;
+                tokio::io::copy(&mut download, &mut out).await.map_err(|e| format!("{e:?}"))?;
+                Ok(out)
+            }
+
+            async fn assert_exact(&self, case: &str) {
+                let recovered = self.recover(self.recovery().expect(case)).await.unwrap_or_else(|e| panic!("{case}: recovery: {e:?}"));
+                assert!(recovered == self.data[..], "{case}: SlabRecovery bytes differ");
+                let downloaded = self.download().await.unwrap_or_else(|e| panic!("{case}: download: {e}"));
+                assert!(downloaded == self.data[..], "{case}: Download bytes differ");
+            }
+        }
+
+        /// Hosts of shards 0-2 unknown, shards 3-19 unreadable: only the parity
+        /// shards 20-29 survive (indices beyond the 27 remaining sectors).
+        #[sia_core_derive::cross_target_test]
+        async fn parity_only_noncontiguous_recovers_exact_bytes() {
+            let f = Fixture::new().await;
+            f.forget(0..3);
+            f.fail_reads(3..20);
+            f.assert_exact("parity-only 20..29").await;
+        }
+
+        /// Hosts of the LAST shards unknown and data shards 0-4 unreadable: the
+        /// erasure code must still be 10+20, not 10+(remaining - 10).
+        #[sia_core_derive::cross_target_test]
+        async fn trailing_hosts_unknown_recovers_exact_bytes() {
+            let f = Fixture::new().await;
+            f.forget(27..30);
+            f.fail_reads(0..5);
+            f.assert_exact("trailing 27..29 unknown, data 0..4 unreadable").await;
+        }
+
+        /// One storage endpoint gone (shard 0's host) and real out-of-order
+        /// completion: shards 1-19 are slow, so 20-29 (index 29 = the
+        /// remaining count) complete first.
+        #[sia_core_derive::cross_target_test]
+        async fn one_unknown_host_out_of_order_recovers_exact_bytes() {
+            let f = Fixture::new().await;
+            f.forget([0]);
+            f.transport.set_slow_hosts((1..20).map(|i| f.host_of(i)), Duration::from_secs(3));
+            let recovered = f.recover(f.recovery().unwrap()).await.expect("recovery");
+            assert!(recovered == f.data[..], "SlabRecovery bytes differ");
+            f.transport.reset_slow_hosts();
+        }
+
+        /// Losing any single endpoint returns the exact bytes.
+        #[sia_core_derive::cross_target_test]
+        async fn single_host_loss_at_each_position_recovers_exact_bytes() {
+            let f = Fixture::new().await;
+            for k in [0, 5, 9, 10, 19, 20, 28, 29] {
+                f.forget([k]);
+                f.assert_exact(&format!("host of shard {k} unknown")).await;
+            }
+        }
+
+        /// Fewer than min_shards survivors fail with NotEnoughShards, never a
+        /// panic and never bytes.
+        #[sia_core_derive::cross_target_test]
+        async fn insufficient_shards_fail_cleanly() {
+            let f = Fixture::new().await;
+            f.forget(0..15);
+            f.fail_reads(15..21);
+            match f.recover(f.recovery().unwrap()).await {
+                Err(DownloadError::NotEnoughShards(have, 10)) => assert!(have < 10),
+                other => panic!("expected NotEnoughShards, got {:?}", other.map(|b| b.len())),
+            }
+            assert!(f.download().await.is_err(), "the reader must return an error");
+            f.forget(0..21);
+            match f.recovery() {
+                Err(DownloadError::NotEnoughShards(9, 10)) => {}
+                other => panic!("expected NotEnoughShards(9, 10), got {:?}", other.err()),
+            }
+        }
+
+        /// A task whose shard index lies outside the slab, or two tasks for one
+        /// index, are refused as InvalidSlab (only 10 sectors are known, so every
+        /// task's result is needed and the check is reached deterministically).
+        #[sia_core_derive::cross_target_test]
+        async fn malformed_shard_indices_are_refused() {
+            let f = Fixture::new().await;
+            f.forget(10..30);
+            let mut recovery = f.recovery().unwrap();
+            assert_eq!(recovery.state.sectors.len(), 10);
+            recovery.state.sectors[3].0.shard_index = 30;
+            match f.recover(recovery).await {
+                Err(DownloadError::InvalidSlab(msg)) => assert!(msg.contains("outside"), "{msg}"),
+                other => panic!("expected InvalidSlab, got {:?}", other.map(|b| b.len())),
+            }
+            let mut recovery = f.recovery().unwrap();
+            let first = recovery.state.sectors[0].0.shard_index;
+            recovery.state.sectors[1].0.shard_index = first;
+            match f.recover(recovery).await {
+                Err(DownloadError::InvalidSlab(msg)) => assert!(msg.contains("twice"), "{msg}"),
+                other => panic!("expected InvalidSlab, got {:?}", other.map(|b| b.len())),
+            }
+        }
+    }
+}

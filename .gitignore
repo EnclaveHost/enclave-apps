@@ -7,3 +7,5 @@ venv/
 .DS_Store
 risc-box/guest/fbdoom/xdoom
 jot/model/
+sia-s3/target/
+sia-s3/spike/target/

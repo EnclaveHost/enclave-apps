@@ -1,0 +1,789 @@
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, RwLock};
+
+use base64::engine::general_purpose::URL_SAFE;
+use base64::prelude::*;
+use chrono::{DateTime, Utc};
+use reqwest::{Method, StatusCode};
+use sia_core::rhp4::{AccountToken, SECTOR_SIZE};
+use sia_core::signing::{PrivateKey, PublicKey};
+use sia_core::types::Hash256;
+
+use super::{
+    AuthApproval, Error, KeyResponse, PinObjectError, RegisterAppResponse, SHARE_URL_SCHEME,
+    SealedObjectEvent, SharedHost, SlabPinParams, Url, sign,
+};
+use crate::encryption::EncryptionKey;
+use crate::hosts::Host;
+use crate::sharing::{KeyRequest, Nonce, SharedObjectRequest};
+use crate::slabs::{SealedObjectSummary, Slab};
+use crate::time::Duration;
+use crate::{Account, App, AppMetadata, HostQuery, KeyStats, Object, ObjectsCursor, SealedObject};
+
+const MOCK_AUTHORITY: &str = "mock.indexd";
+
+#[derive(Debug)]
+struct StoredObject {
+    /// `None` once the object has been deleted. The tombstone is retained so
+    /// [`Client::objects`] reports the deletion, matching the indexer.
+    sealed: Option<SealedObject>,
+    updated_at: DateTime<Utc>,
+}
+
+/// A sharing key and the objects attached to it.
+#[derive(Debug)]
+struct StoredSharingKey {
+    account: PublicKey,
+    public_key: PublicKey,
+    nonce: Nonce,
+    description: String,
+    expires_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    attached: HashMap<Hash256, SealedObject>,
+}
+
+/// What the mock keeps per pinned slab. Only the shard counts are read back,
+/// for the account figures.
+#[derive(Debug)]
+struct StoredSlab {
+    min_shards: u8,
+    sectors: usize,
+}
+
+#[derive(Debug, Default)]
+struct State {
+    hosts: Vec<Host>,
+    objects: HashMap<Hash256, StoredObject>,
+    slabs: HashMap<Hash256, StoredSlab>,
+    user_secret: Hash256,
+    pin_slabs_calls: usize,
+    #[cfg(test)]
+    pin_slabs_requests: Vec<Vec<SlabPinParams>>,
+    pin_slabs_errors: VecDeque<Error>,
+    sharing_keys: HashMap<PublicKey, StoredSharingKey>,
+}
+
+/// An in-memory stand-in for the indexer API.
+///
+/// Only the behaviour the SDK depends on is modelled: objects are stored as the
+/// [`SealedObject`] they were pinned with, so `seal`/`open` still round-trips,
+/// and [`Client::hosts`] honours `offset`/`limit` so the SDK's paged host
+/// refresh terminates. Other [`HostQuery`] filters are ignored.
+#[derive(Clone, Default)]
+pub(crate) struct Client {
+    state: Arc<RwLock<State>>,
+}
+
+#[cfg(test)]
+impl Client {
+    /// Returns the slab pin parameters sent in each call to [`Client::pin_slabs`],
+    /// including the calls made to fail.
+    pub(crate) fn pin_slabs_requests(&self) -> Vec<Vec<SlabPinParams>> {
+        self.state.read().unwrap().pin_slabs_requests.clone()
+    }
+}
+
+impl Client {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Appends to the host list returned by [`Client::hosts`].
+    pub(crate) fn add_hosts(&self, hosts: Vec<Host>) {
+        self.state.write().unwrap().hosts.extend(hosts);
+    }
+
+    /// Returns the number of slabs currently pinned.
+    pub(crate) fn pinned_slabs(&self) -> usize {
+        self.state.read().unwrap().slabs.len()
+    }
+
+    /// Makes the next `failures` calls to [`Client::pin_slabs`] fail with an
+    /// [`Error::Api`] before they resume succeeding.
+    pub(crate) fn set_pin_slabs_failures(&self, failures: usize) {
+        self.set_pin_slabs_errors((0..failures).map(|_| {
+            Error::Api(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "temporary pin failure".to_string(),
+            )
+        }));
+    }
+
+    /// Returns the given errors on successive pin requests, then succeeds.
+    pub(crate) fn set_pin_slabs_errors(&self, errors: impl IntoIterator<Item = Error>) {
+        self.state.write().unwrap().pin_slabs_errors = errors.into_iter().collect();
+    }
+
+    /// Returns the number of times [`Client::pin_slabs`] has been called,
+    /// including the calls made to fail.
+    pub(crate) fn pin_slabs_calls(&self) -> usize {
+        self.state.read().unwrap().pin_slabs_calls
+    }
+
+    pub(crate) async fn check_app_authenticated(&self, _: &PrivateKey) -> Result<bool, Error> {
+        Ok(true)
+    }
+
+    pub(crate) async fn request_app_connection(
+        &self,
+        _: &PrivateKey,
+        _: &AppMetadata,
+    ) -> Result<RegisterAppResponse, Error> {
+        let base = format!("{SHARE_URL_SCHEME}://{MOCK_AUTHORITY}/auth/connect/mock");
+        Ok(RegisterAppResponse {
+            response_url: base.clone(),
+            status_url: format!("{base}/status"),
+            register_url: format!("{base}/register"),
+            expiration: Utc::now() + Duration::from_secs(600),
+        })
+    }
+
+    pub(crate) async fn request_app_connection_pre_authorized(
+        &self,
+        ephemeral_key: &PrivateKey,
+        opts: &AppMetadata,
+        _: &PrivateKey,
+    ) -> Result<RegisterAppResponse, Error> {
+        self.request_app_connection(ephemeral_key, opts).await
+    }
+
+    pub(crate) async fn check_request_status(
+        &self,
+        _: &PrivateKey,
+        _: Url,
+    ) -> Result<Option<AuthApproval>, Error> {
+        Ok(Some(AuthApproval {
+            user_secret: self.state.read().unwrap().user_secret,
+            reconnecting: false,
+        }))
+    }
+
+    pub(crate) async fn register_app(
+        &self,
+        _: &PrivateKey,
+        _: &PrivateKey,
+        _: Url,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    pub(crate) async fn hosts(&self, _: &PrivateKey, query: HostQuery) -> Result<Vec<Host>, Error> {
+        let state = self.state.read().unwrap();
+        let offset = query.offset.unwrap_or(0) as usize;
+        let limit = query.limit.map_or(usize::MAX, |l| l as usize);
+        Ok(state
+            .hosts
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(|h| Host {
+                public_key: h.public_key,
+                addresses: h.addresses.clone(),
+                country_code: h.country_code.clone(),
+                latitude: h.latitude,
+                longitude: h.longitude,
+                good_for_upload: h.good_for_upload,
+            })
+            .collect())
+    }
+
+    pub(crate) async fn object(
+        &self,
+        _: &PrivateKey,
+        key: &Hash256,
+    ) -> Result<SealedObject, Error> {
+        self.state
+            .read()
+            .unwrap()
+            .objects
+            .get(key)
+            .and_then(|o| o.sealed.clone())
+            .ok_or_else(|| Error::Api(StatusCode::NOT_FOUND, format!("object {key} not found")))
+    }
+
+    pub(crate) async fn objects(
+        &self,
+        _: &PrivateKey,
+        cursor: Option<ObjectsCursor>,
+        limit: Option<usize>,
+    ) -> Result<Vec<SealedObjectEvent>, Error> {
+        let state = self.state.read().unwrap();
+        let mut events: Vec<SealedObjectEvent> = state
+            .objects
+            .iter()
+            .map(|(id, stored)| SealedObjectEvent {
+                id: *id,
+                deleted: stored.sealed.is_none(),
+                updated_at: stored.updated_at,
+                object: stored.sealed.clone(),
+            })
+            .collect();
+        // Hash256 is not Ord; order by its raw bytes so the cursor has a
+        // total order to compare against.
+        let sort_key = |e: &SealedObjectEvent| (e.updated_at, *AsRef::<[u8; 32]>::as_ref(&e.id));
+        events.sort_by_key(sort_key);
+        if let Some(ObjectsCursor { after, id }) = cursor {
+            let cursor = (after, *AsRef::<[u8; 32]>::as_ref(&id));
+            events.retain(|e| sort_key(e) > cursor);
+        }
+        events.truncate(limit.unwrap_or(usize::MAX));
+        Ok(events)
+    }
+
+    pub(crate) async fn pin_object(
+        &self,
+        _: &PrivateKey,
+        object: &SealedObject,
+    ) -> Result<(), PinObjectError> {
+        let mut state = self.state.write().unwrap();
+        if object
+            .slabs
+            .iter()
+            .any(|slab| !state.slabs.contains_key(&slab.digest()))
+        {
+            return Err(PinObjectError::UnpinnedSlab);
+        }
+        state.objects.insert(
+            object.id(),
+            StoredObject {
+                sealed: Some(object.clone()),
+                updated_at: Utc::now(),
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn delete_object(&self, _: &PrivateKey, key: &Hash256) -> Result<(), Error> {
+        let mut state = self.state.write().unwrap();
+        match state.objects.get_mut(key) {
+            Some(stored) => {
+                stored.sealed = None;
+                stored.updated_at = Utc::now();
+            }
+            None => {
+                return Err(Error::Api(
+                    StatusCode::NOT_FOUND,
+                    format!("object {key} not found"),
+                ));
+            }
+        }
+        // Deleting an object detaches it from every sharing key it was
+        // attached to.
+        for stored in state.sharing_keys.values_mut() {
+            stored.attached.remove(key);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn pin_slabs(
+        &self,
+        _: &PrivateKey,
+        slabs: &[SlabPinParams],
+    ) -> Result<Vec<Hash256>, Error> {
+        let mut state = self.state.write().unwrap();
+        state.pin_slabs_calls += 1;
+        #[cfg(test)]
+        state.pin_slabs_requests.push(slabs.to_vec());
+        if let Some(error) = state.pin_slabs_errors.pop_front() {
+            return Err(error);
+        }
+        Ok(slabs
+            .iter()
+            .map(|params| {
+                let slab = Slab::from(params);
+                let id = slab.digest();
+                state.slabs.insert(
+                    id,
+                    StoredSlab {
+                        min_shards: slab.min_shards,
+                        sectors: slab.sectors.len(),
+                    },
+                );
+                id
+            })
+            .collect())
+    }
+
+    /// `before` is accepted and ignored: a mock slab carries no pin time to
+    /// compare it against, so every orphan is pruned.
+    pub(crate) async fn prune_slabs(
+        &self,
+        _: &PrivateKey,
+        _before: Option<DateTime<Utc>>,
+    ) -> Result<(), Error> {
+        let mut state = self.state.write().unwrap();
+        let referenced: HashSet<Hash256> = state
+            .objects
+            .values()
+            .filter_map(|o| o.sealed.as_ref())
+            .flat_map(|sealed| sealed.slabs.iter().map(|s| s.digest()))
+            .collect();
+        state.slabs.retain(|id, _| referenced.contains(id));
+        Ok(())
+    }
+
+    pub(crate) async fn account(&self, app_key: &PrivateKey) -> Result<Account, Error> {
+        let state = self.state.read().unwrap();
+        let pinned_size: u64 = state
+            .slabs
+            .values()
+            .map(|s| (s.sectors * SECTOR_SIZE) as u64)
+            .sum();
+        let pinned_data: u64 = state
+            .slabs
+            .values()
+            .map(|s| (s.min_shards as usize * SECTOR_SIZE) as u64)
+            .sum();
+        Ok(Account {
+            account_key: app_key.public_key(),
+            max_pinned_data: u64::MAX,
+            remaining_storage: u64::MAX - pinned_data,
+            pinned_data,
+            pinned_size,
+            ready: true,
+            app: App {
+                id: Hash256::default(),
+                name: "mock".to_string(),
+                description: "mock indexer".to_string(),
+                logo_url: None,
+                service_url: None,
+            },
+            last_used: Utc::now(),
+        })
+    }
+
+    pub(crate) fn shared_object_url(
+        &self,
+        app_key: &PrivateKey,
+        object: &Object,
+        valid_until: DateTime<Utc>,
+    ) -> Result<Url, Error> {
+        let mut url: Url = format!(
+            "{SHARE_URL_SCHEME}://{MOCK_AUTHORITY}/objects/{}/shared",
+            object.id()
+        )
+        .parse()?;
+
+        let params = sign(app_key, &url, Method::GET, None, valid_until);
+        url.set_fragment(Some(
+            format!(
+                "encryption_key={}",
+                URL_SAFE.encode(object.data_key.as_ref())
+            )
+            .as_str(),
+        ));
+
+        let mut pairs = url.query_pairs_mut();
+        for (key, value) in params {
+            pairs.append_pair(key, value.as_str());
+        }
+
+        Ok(pairs.finish().to_owned())
+    }
+
+    pub(crate) async fn shared_object(&self, share_url: Url) -> Result<Object, Error> {
+        if share_url.scheme() != SHARE_URL_SCHEME {
+            return Err(Error::Format(format!(
+                "invalid url scheme: expected {SHARE_URL_SCHEME}"
+            )));
+        }
+        let data_key = match share_url.fragment() {
+            Some(fragment) => {
+                let fragment = fragment
+                    .strip_prefix("encryption_key=")
+                    .ok_or(Error::Format("missing encryption_key".into()))?;
+                let mut out = [0u8; 32];
+                match URL_SAFE.decode_slice(fragment, &mut out) {
+                    Ok(32) => Ok(EncryptionKey::from(out)),
+                    _ => Err(Error::Format(
+                        "encryption key must be 32 bytes, base64url-encoded".into(),
+                    )),
+                }
+            }
+            None => Err(Error::Format("missing encryption_key".into())),
+        }?;
+
+        // ../objects/:id/shared
+        let id: Hash256 = share_url
+            .path_segments()
+            .and_then(|segments| segments.rev().nth(1).map(str::to_string))
+            .ok_or(Error::Format("invalid share url format".into()))?
+            .parse()
+            .map_err(|_| Error::Format("invalid object id".into()))?;
+
+        let sealed = self
+            .state
+            .read()
+            .unwrap()
+            .objects
+            .get(&id)
+            .and_then(|o| o.sealed.clone())
+            .ok_or_else(|| Error::Api(StatusCode::NOT_FOUND, format!("object {id} not found")))?;
+
+        Ok(Object {
+            data_key,
+            slabs: sealed.slabs,
+            ..Default::default()
+        })
+    }
+
+    /// Records a sharing key. It must echo the submitted public key and nonce:
+    /// `create_sharing_key` verifies the response against the nonce it generated.
+    pub(crate) async fn add_sharing_key(
+        &self,
+        app_key: &PrivateKey,
+        req: &KeyRequest,
+    ) -> Result<KeyResponse, Error> {
+        let mut state = self.state.write().unwrap();
+        if state.sharing_keys.contains_key(&req.public_key) {
+            return Err(Error::Api(
+                StatusCode::CONFLICT,
+                "sharing key already exists".into(),
+            ));
+        }
+        let stored = StoredSharingKey {
+            account: app_key.public_key(),
+            public_key: req.public_key,
+            nonce: req.nonce,
+            description: req.description.clone(),
+            expires_at: req.expires_at,
+            created_at: Utc::now(),
+            attached: HashMap::new(),
+        };
+        let response = stored.response();
+        state.sharing_keys.insert(req.public_key, stored);
+        Ok(response)
+    }
+
+    pub(crate) async fn sharing_keys(
+        &self,
+        app_key: &PrivateKey,
+        offset: Option<u64>,
+        limit: Option<u64>,
+    ) -> Result<Vec<KeyResponse>, Error> {
+        let owner = app_key.public_key();
+        let state = self.state.read().unwrap();
+        // Scoped to the caller's own keys. Returning another account's key here
+        // would fail nonce re-derivation in the SDK and surface as KeyMismatch.
+        let mut keys: Vec<_> = state
+            .sharing_keys
+            .values()
+            .filter(|k| k.account == owner && !k.expired())
+            .collect();
+        // Newest first, matching indexd, with the key's bytes breaking ties.
+        keys.sort_by_key(|k| (k.created_at, k.public_key.as_ref().to_vec()));
+        keys.reverse();
+        Ok(keys
+            .into_iter()
+            .skip(offset.unwrap_or(0) as usize)
+            .take(limit.map_or(usize::MAX, |l| l as usize))
+            .map(StoredSharingKey::response)
+            .collect())
+    }
+
+    pub(crate) async fn sharing_key(
+        &self,
+        app_key: &PrivateKey,
+        public_key: &PublicKey,
+    ) -> Result<KeyResponse, Error> {
+        let state = self.state.read().unwrap();
+        Ok(Self::active(&state, app_key, public_key)?.response())
+    }
+
+    pub(crate) async fn delete_sharing_key(
+        &self,
+        app_key: &PrivateKey,
+        public_key: &PublicKey,
+    ) -> Result<(), Error> {
+        let owner = app_key.public_key();
+        let mut state = self.state.write().unwrap();
+        // Checked before removing so one account cannot revoke another's key.
+        match state.sharing_keys.get(public_key) {
+            Some(k) if k.account == owner => {}
+            _ => return Err(key_not_found(public_key)),
+        }
+        state.sharing_keys.remove(public_key);
+        Ok(())
+    }
+
+    pub(crate) async fn add_shared_object(
+        &self,
+        app_key: &PrivateKey,
+        sharing_key: &PublicKey,
+        req: &SharedObjectRequest,
+    ) -> Result<(), Error> {
+        let now = Utc::now();
+        let mut state = self.state.write().unwrap();
+        let slabs = state
+            .objects
+            .get(&req.object_id)
+            .and_then(|o| o.sealed.as_ref())
+            .ok_or_else(|| {
+                Error::Api(
+                    StatusCode::NOT_FOUND,
+                    format!("object {} not found", req.object_id),
+                )
+            })?
+            .slabs
+            .clone();
+        let stored = Self::active_mut(&mut state, app_key, sharing_key)?;
+        // The request carries the object's keys re-sealed under the sharing
+        // key, so store those rather than the account-sealed originals.
+        stored.attached.insert(
+            req.object_id,
+            SealedObject {
+                slabs,
+                created_at: now,
+                updated_at: now,
+                encrypted_data_key: req.encrypted_data_key.clone(),
+                data_signature: req.data_signature.clone(),
+                encrypted_metadata_key: req.encrypted_metadata_key.clone(),
+                encrypted_metadata: req.encrypted_metadata.clone(),
+                metadata_signature: req.metadata_signature.clone(),
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn sharing_key_objects(
+        &self,
+        app_key: &PrivateKey,
+        sharing_key: &PublicKey,
+        offset: Option<u64>,
+        limit: Option<u64>,
+    ) -> Result<Vec<SealedObject>, Error> {
+        let state = self.state.read().unwrap();
+        Ok(Self::active(&state, app_key, sharing_key)?.page(offset, limit))
+    }
+
+    /// Looks up a key the calling account owns.
+    ///
+    /// A key belonging to another account is reported as missing rather than
+    /// forbidden. That is what indexd's queries produce by filtering on
+    /// `account_id`, and it keeps one account from probing for the existence of
+    /// another's keys.
+    fn owned<'a>(
+        state: &'a State,
+        app_key: &PrivateKey,
+        public_key: &PublicKey,
+    ) -> Result<&'a StoredSharingKey, Error> {
+        state
+            .sharing_keys
+            .get(public_key)
+            .filter(|k| k.account == app_key.public_key())
+            .ok_or_else(|| key_not_found(public_key))
+    }
+
+    /// Mutable counterpart of [`Client::owned`].
+    fn owned_mut<'a>(
+        state: &'a mut State,
+        app_key: &PrivateKey,
+        public_key: &PublicKey,
+    ) -> Result<&'a mut StoredSharingKey, Error> {
+        let owner = app_key.public_key();
+        state
+            .sharing_keys
+            .get_mut(public_key)
+            .filter(|k| k.account == owner)
+            .ok_or_else(|| key_not_found(public_key))
+    }
+
+    /// Owner-scoped lookup that also rejects an expired key.
+    ///
+    /// indexd gates reads and new attachments on `expires_at`, but deliberately
+    /// does not gate revoking or detaching, so an owner can still clean up after
+    /// a key expires. Those two paths use [`Client::owned`] and
+    /// [`Client::owned_mut`] directly for that reason.
+    fn active<'a>(
+        state: &'a State,
+        app_key: &PrivateKey,
+        public_key: &PublicKey,
+    ) -> Result<&'a StoredSharingKey, Error> {
+        let stored = Self::owned(state, app_key, public_key)?;
+        if stored.expired() {
+            return Err(key_not_found(public_key));
+        }
+        Ok(stored)
+    }
+
+    /// Mutable counterpart of [`Client::active`].
+    fn active_mut<'a>(
+        state: &'a mut State,
+        app_key: &PrivateKey,
+        public_key: &PublicKey,
+    ) -> Result<&'a mut StoredSharingKey, Error> {
+        let stored = Self::owned_mut(state, app_key, public_key)?;
+        if stored.expired() {
+            return Err(key_not_found(public_key));
+        }
+        Ok(stored)
+    }
+
+    /// Authenticates a `/shared` request the way the indexer does, by the public
+    /// half of the key it is signed with. An expired key authenticates nothing,
+    /// which is how a key with an expiry stops granting access without anyone
+    /// having to revoke it.
+    fn shared<'a>(
+        state: &'a State,
+        sharing_key: &PrivateKey,
+    ) -> Result<&'a StoredSharingKey, Error> {
+        let public_key = sharing_key.public_key();
+        state
+            .sharing_keys
+            .get(&public_key)
+            .filter(|k| !k.expired())
+            .ok_or_else(|| {
+                Error::Api(
+                    StatusCode::UNAUTHORIZED,
+                    format!("sharing key {public_key} not found"),
+                )
+            })
+    }
+
+    pub(crate) async fn shared_stats(&self, sharing_key: &PrivateKey) -> Result<KeyStats, Error> {
+        let state = self.state.read().unwrap();
+        let record = Self::shared(&state, sharing_key)?.response();
+        Ok(record.stats)
+    }
+
+    pub(crate) async fn shared_objects(
+        &self,
+        sharing_key: &PrivateKey,
+        offset: Option<u64>,
+        limit: Option<u64>,
+    ) -> Result<Vec<SealedObject>, Error> {
+        let state = self.state.read().unwrap();
+        Ok(Self::shared(&state, sharing_key)?.page(offset, limit))
+    }
+
+    /// Reports each object's size, as indexers that include it in listings
+    /// without slabs do.
+    pub(crate) async fn shared_object_summaries(
+        &self,
+        sharing_key: &PrivateKey,
+        offset: Option<u64>,
+        limit: Option<u64>,
+    ) -> Result<Vec<SealedObjectSummary>, Error> {
+        let state = self.state.read().unwrap();
+        Ok(Self::shared(&state, sharing_key)?
+            .page(offset, limit)
+            .into_iter()
+            .map(|sealed| SealedObjectSummary {
+                object_id: sealed.id(),
+                size: sealed.slabs.iter().map(|s| s.length as u64).sum(),
+                encrypted_metadata_key: sealed.encrypted_metadata_key,
+                encrypted_metadata: sealed.encrypted_metadata,
+                metadata_signature: sealed.metadata_signature,
+                created_at: sealed.created_at,
+                updated_at: sealed.updated_at,
+            })
+            .collect())
+    }
+
+    pub(crate) async fn shared_object_by_id(
+        &self,
+        sharing_key: &PrivateKey,
+        key: &Hash256,
+    ) -> Result<SealedObject, Error> {
+        let state = self.state.read().unwrap();
+        Self::shared(&state, sharing_key)?
+            .attached
+            .get(key)
+            .cloned()
+            .ok_or_else(|| Error::Api(StatusCode::NOT_FOUND, format!("object {key} not found")))
+    }
+
+    /// Signs every token with one stand-in account key. Nothing in the SDK
+    /// inspects which account paid, only that a token is present and unexpired.
+    pub(crate) async fn shared_hosts(
+        &self,
+        sharing_key: &PrivateKey,
+        query: HostQuery,
+    ) -> Result<Vec<SharedHost>, Error> {
+        let state = self.state.read().unwrap();
+        Self::shared(&state, sharing_key)?;
+        let account_key = PrivateKey::from_seed(&[7u8; 32]);
+        let offset = query.offset.unwrap_or(0) as usize;
+        let limit = query.limit.map_or(usize::MAX, |l| l as usize);
+        Ok(state
+            .hosts
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(|h| SharedHost {
+                token: AccountToken::new(&account_key, h.public_key),
+                host: h.clone(),
+            })
+            .collect())
+    }
+
+    pub(crate) async fn delete_shared_object(
+        &self,
+        app_key: &PrivateKey,
+        sharing_key: &PublicKey,
+        object_key: &Hash256,
+    ) -> Result<(), Error> {
+        let mut state = self.state.write().unwrap();
+        let stored = Self::owned_mut(&mut state, app_key, sharing_key)?;
+        if stored.attached.remove(object_key).is_none() {
+            return Err(Error::Api(
+                StatusCode::NOT_FOUND,
+                format!("object {object_key} is not attached"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn key_not_found(public_key: &PublicKey) -> Error {
+    Error::Api(
+        StatusCode::NOT_FOUND,
+        format!("sharing key {public_key} not found"),
+    )
+}
+
+impl StoredSharingKey {
+    /// Whether the key's expiry has passed. indexd keeps expired rows until
+    /// `PruneExpiredSharingKeys` sweeps them, and filters them out of its
+    /// queries in the meantime, so the mock keeps them and filters too.
+    fn expired(&self) -> bool {
+        self.expires_at.is_some_and(|t| t <= Utc::now())
+    }
+
+    /// Builds the record the sharing key API returns, with counts derived from
+    /// what is currently attached.
+    fn response(&self) -> KeyResponse {
+        let object_size: u64 = self
+            .attached
+            .values()
+            .flat_map(|o| o.slabs.iter())
+            .map(|s| s.length as u64)
+            .sum();
+        KeyResponse {
+            public_key: self.public_key,
+            nonce: self.nonce,
+            account: self.account,
+            description: self.description.clone(),
+            stats: KeyStats {
+                object_count: self.attached.len() as u64,
+                object_size,
+                pinned_data: object_size,
+                pinned_size: object_size,
+                expires_at: self.expires_at,
+                created_at: self.created_at,
+                updated_at: self.created_at,
+            },
+        }
+    }
+
+    /// Returns a stable page of the attached objects, ordered by id.
+    fn page(&self, offset: Option<u64>, limit: Option<u64>) -> Vec<SealedObject> {
+        let mut ids: Vec<_> = self.attached.keys().copied().collect();
+        ids.sort_by_key(|id| *AsRef::<[u8; 32]>::as_ref(id));
+        ids.into_iter()
+            .skip(offset.unwrap_or(0) as usize)
+            .take(limit.map_or(usize::MAX, |l| l as usize))
+            .filter_map(|id| self.attached.get(&id).cloned())
+            .collect()
+    }
+}

@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
+  <!-- sia-s3: an object rises out of an S3 bucket as a slab of shards. Solid
+       shards carry the data, outlined ones are parity: any third of them
+       rebuilds the object, so no single host matters. -->
+  <!-- the bucket: an S3 cylinder -->
+  <path d="M22 62 v16 a26 8 0 0 0 52 0 v-16" fill="#101620" stroke="#2a3242" stroke-width="2"/>
+  <ellipse cx="48" cy="62" rx="26" ry="8" fill="#151b28" stroke="#2a3242" stroke-width="2"/>
+  <text x="48" y="77.5" font-family="monospace" font-size="7" fill="#6b7488" text-anchor="middle">s3</text>
+  <!-- the slab: 3 x 3 shards, the bottom row still in the bucket's mouth -->
+  <g stroke="#3fc7a6" stroke-width="2" stroke-linejoin="round">
+    <g fill="#3fc7a6">
+      <rect x="22" y="8" width="14" height="14" rx="2.5"/>
+      <rect x="41" y="27" width="14" height="14" rx="2.5"/>
+      <rect x="60" y="46" width="14" height="14" rx="2.5"/>
+    </g>
+    <g fill="#101620">
+      <rect x="41" y="8" width="14" height="14" rx="2.5"/>
+      <rect x="60" y="8" width="14" height="14" rx="2.5"/>
+      <rect x="22" y="27" width="14" height="14" rx="2.5"/>
+      <rect x="60" y="27" width="14" height="14" rx="2.5"/>
+      <rect x="22" y="46" width="14" height="14" rx="2.5"/>
+      <rect x="41" y="46" width="14" height="14" rx="2.5"/>
+    </g>
+  </g>
+</svg>

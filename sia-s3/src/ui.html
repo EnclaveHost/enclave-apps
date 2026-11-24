@@ -1,0 +1,2080 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Sia S3</title>
+<link rel="icon" href="/logo.svg" type="image/svg+xml">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0e14; --panel: #10141d; --panel2: #0d1119; --edge: #1e2430; --edge2: #2a3242;
+    --ink: #d7dde8; --dim: #8a94a6; --faint: #5a6375;
+    --amber: #e8a34c; --amber-hi: #ffc46b; --red: #e05e5e; --green: #6fcf8f;
+    --sel: #2a2216; --sel-edge: #6b4e24; --hover: #151a25;
+    --k-image: #6fcf8f; --k-video: #b48cf2; --k-audio: #f28cc6; --k-pdf: #f07a6a; --k-text: #7cb4f2;
+    --k-archive: #e8c34c; --k-binary: #8a94a6;
+    --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 var(--mono);
+    background-image: radial-gradient(ellipse 80% 50% at 50% -10%, #151b28 0%, transparent 60%);
+  }
+  a { color: var(--amber); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .hidden { display: none !important; }
+  svg.ic { width: 18px; height: 18px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  button {
+    background: var(--amber); color: #14100a; border: 0; border-radius: 8px;
+    padding: 8px 18px; font: 600 13px var(--mono); cursor: pointer; letter-spacing: .04em;
+  }
+  button:hover { background: var(--amber-hi); }
+  button:disabled { opacity: .45; cursor: default; }
+  button:focus-visible, .tn:focus-visible { outline: 2px solid var(--amber); outline-offset: 1px; }
+  .files:focus-visible { outline: none; box-shadow: inset 0 0 0 1px var(--sel-edge); }
+  button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--edge2); font-weight: 400; }
+  button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--amber); }
+  button.danger { background: var(--red); color: #fff; }
+  button.danger:hover { background: #f07272; }
+  input[type=text], input[type=password], input[type=search], select {
+    background: var(--panel2); color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 7px; padding: 8px 12px; font: 13px var(--mono); min-width: 0;
+  }
+  input:focus, select:focus { border-color: var(--amber); outline: none; }
+  pre {
+    background: var(--panel2); border: 1px solid var(--edge2); border-radius: 7px; padding: 10px 12px;
+    font: 12.5px/1.55 var(--mono); color: var(--amber-hi); overflow-x: auto; margin: 8px 0 0; white-space: pre;
+  }
+  .mini { font-size: 11.5px; color: var(--faint); }
+  .note { color: var(--dim); font-size: 13px; margin-top: 8px; }
+  .err { color: var(--red); font-size: 13px; margin-top: 10px; white-space: pre-wrap; word-break: break-word; }
+  .copy {
+    cursor: pointer; color: var(--dim); border: 1px solid var(--edge2); border-radius: 5px;
+    padding: 0 7px; font: 11px var(--mono); background: transparent; margin-left: 6px; letter-spacing: 0;
+  }
+  .copy:hover { color: var(--ink); border-color: var(--amber); background: transparent; }
+  .kv { display: flex; gap: 10px 26px; flex-wrap: wrap; font-size: 13px; color: var(--dim); }
+  .kv b { color: var(--ink); font-weight: 600; word-break: break-all; }
+  .state-ready { color: var(--green) !important; }
+  .state-busy { color: var(--amber-hi) !important; }
+  .state-bad { color: var(--red) !important; }
+  table.bt { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 13px; }
+  table.bt th { text-align: left; color: var(--faint); font-weight: 400; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--edge2); }
+  table.bt td { padding: 5px 10px 5px 0; border-bottom: 1px solid var(--edge); }
+
+  /* ---------- locked page ---------- */
+  #locked { display: flex; flex-direction: column; align-items: center; min-height: 100%; }
+  #locked main { width: 100%; max-width: 980px; padding: 0 16px 40px; }
+  #locked header { text-align: center; padding: 36px 0 6px; }
+  #locked header img { width: 56px; height: 56px; }
+  .mark { font-size: 24px; letter-spacing: .1em; color: var(--amber); margin-top: 6px; }
+  .mark b { color: var(--ink); font-weight: 600; }
+  .tag { color: var(--dim); font-size: 13px; margin-top: 6px; }
+  .card { background: var(--panel); border: 1px solid var(--edge); border-radius: 10px; padding: 18px 22px; margin-top: 20px; }
+  h2 { font-size: 14px; margin: 0 0 10px; color: var(--dim); letter-spacing: .08em; font-weight: 600; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+  .row input[type=text], .row input[type=password] { flex: 1 1 220px; }
+  label.chk { color: var(--dim); font-size: 12px; display: flex; gap: 6px; align-items: center; }
+  footer { color: var(--faint); font-size: 11.5px; text-align: center; padding: 26px 16px 34px; max-width: 720px; margin: 0 auto; }
+
+  /* ---------- explorer shell ---------- */
+  #app { height: 100%; display: grid; grid-template-rows: auto auto 1fr auto; font-size: 13px; }
+  .top { display: flex; align-items: center; gap: 10px; padding: 8px 14px; border-bottom: 1px solid var(--edge); background: rgba(16,20,29,.85); min-width: 0; }
+  .top img { width: 26px; height: 26px; }
+  .top .mark { font-size: 16px; margin: 0; white-space: nowrap; }
+  .pill { display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--edge2); border-radius: 999px; padding: 2px 11px; color: var(--dim); font-size: 12px; background: transparent; font-weight: 400; letter-spacing: 0; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .pill:hover { background: transparent; border-color: var(--amber); color: var(--ink); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
+  .dot.ok { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot.busy { background: var(--amber-hi); }
+  .dot.bad { background: var(--red); }
+  .grow { flex: 1; }
+  .ib { display: inline-flex; align-items: center; justify-content: center; gap: 6px; background: transparent; color: var(--dim); border: 1px solid transparent; border-radius: 7px; padding: 5px 8px; font: 400 12.5px var(--mono); letter-spacing: 0; white-space: nowrap; }
+  .ib:hover:not(:disabled) { background: var(--hover); color: var(--ink); border-color: var(--edge2); }
+  .ib.on { color: var(--amber); border-color: var(--edge2); background: var(--hover); }
+  .ib.primary { background: var(--amber); color: #14100a; font-weight: 600; }
+  .ib.primary:hover:not(:disabled) { background: var(--amber-hi); color: #14100a; }
+  .ib.dangerous:hover:not(:disabled) { color: #fff; background: var(--red); border-color: var(--red); }
+
+  .bar { display: flex; align-items: center; gap: 4px; padding: 6px 10px; border-bottom: 1px solid var(--edge); background: var(--panel); flex-wrap: wrap; min-width: 0; }
+  .sep { width: 1px; height: 20px; background: var(--edge2); margin: 0 4px; }
+  .crumbs { display: flex; align-items: center; gap: 2px; min-width: 0; flex: 1 1 200px; overflow: hidden; background: var(--panel2); border: 1px solid var(--edge2); border-radius: 7px; padding: 3px 6px; }
+  .crumbs .cr { color: var(--dim); background: transparent; border: 0; padding: 2px 6px; border-radius: 5px; font: 12.5px var(--mono); letter-spacing: 0; white-space: nowrap; max-width: 260px; overflow: hidden; text-overflow: ellipsis; flex: none; }
+  .crumbs .cr:hover, .crumbs .cr.drop { background: var(--hover); color: var(--ink); }
+  .crumbs .cr.last { color: var(--ink); font-weight: 600; flex: 0 1 auto; }
+  .crumbs .slash { color: var(--faint); flex: none; }
+  .filter { position: relative; flex: 0 1 220px; min-width: 120px; }
+  .filter input { width: 100%; padding: 5px 10px 5px 30px; font-size: 12.5px; }
+  .filter svg { position: absolute; left: 9px; top: 50%; transform: translateY(-50%); width: 15px; height: 15px; color: var(--faint); }
+
+  .ex { display: grid; grid-template-columns: 230px minmax(0, 1fr) 330px; min-height: 0; }
+  .ex.nopv { grid-template-columns: 230px minmax(0, 1fr); }
+  .ex.nopv .pv { display: none; }
+  .side { border-right: 1px solid var(--edge); overflow: auto; padding: 8px 0; background: rgba(13,17,25,.6); }
+  .side h3 { font-size: 11px; letter-spacing: .1em; color: var(--faint); margin: 4px 14px 6px; font-weight: 600; }
+  .tn { display: flex; align-items: center; gap: 5px; padding: 3px 10px; cursor: pointer; color: var(--dim); white-space: nowrap; user-select: none; border-left: 2px solid transparent; }
+  .tn:hover { background: var(--hover); color: var(--ink); }
+  .tn.cur { background: var(--sel); color: var(--ink); border-left-color: var(--amber); }
+  .tn.drop { background: #3a2c14; color: var(--ink); }
+  .tn .car { width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center; color: var(--faint); flex: none; border-radius: 4px; }
+  .tn .car:hover { color: var(--ink); background: var(--edge2); }
+  .tn .car svg { width: 12px; height: 12px; transition: transform .12s; }
+  .tn .car.open svg { transform: rotate(90deg); }
+  .tn .car.leaf { visibility: hidden; }
+  .tn .lbl { overflow: hidden; text-overflow: ellipsis; }
+  .tn svg.ic { width: 16px; height: 16px; }
+  .tn .k-folder, .tn .k-bucket { color: var(--amber); }
+  .tn.loading { color: var(--faint); font-style: italic; cursor: default; }
+
+  .main { display: flex; flex-direction: column; min-width: 0; min-height: 0; position: relative; }
+  .lhead { display: grid; grid-template-columns: 30px minmax(0,1fr) 96px 136px; gap: 0 10px; align-items: center; padding: 0 12px; border-bottom: 1px solid var(--edge2); color: var(--faint); font-size: 12px; min-height: 30px; }
+  .lhead button { background: transparent; color: var(--faint); border: 0; padding: 4px 0; font: 12px var(--mono); text-align: left; letter-spacing: 0; display: flex; align-items: center; gap: 4px; }
+  .lhead button:hover { color: var(--ink); background: transparent; }
+  .lhead button.sorted { color: var(--ink); }
+  .lhead .r { justify-content: flex-end; }
+  .files { flex: 1; overflow: auto; outline: none; padding: 2px 0 30px; position: relative; }
+  .files.list .it { display: grid; grid-template-columns: 30px minmax(0,1fr) 96px 136px; gap: 0 10px; align-items: center; padding: 0 12px; min-height: 32px; border-bottom: 1px solid rgba(30,36,48,.55); cursor: default; user-select: none; }
+  .it .nmw { display: flex; align-items: center; gap: 9px; min-width: 0; }
+  .it .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .it .sz { color: var(--dim); text-align: right; white-space: nowrap; }
+  .it .mt { color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .it .ck { display: flex; align-items: center; justify-content: center; }
+  .it .ck input { accent-color: var(--amber); width: 14px; height: 14px; margin: 0; cursor: pointer; opacity: .35; }
+  .it:hover .ck input, .it.sel .ck input, .files.anysel .ck input { opacity: 1; }
+  .it:hover { background: var(--hover); }
+  .it.sel { background: var(--sel); }
+  .it.cur { box-shadow: inset 2px 0 0 var(--amber); }
+  .it.drop { background: #3a2c14; outline: 1px dashed var(--amber); outline-offset: -1px; }
+  .it.cut { opacity: .5; }
+  .it.dir .nm { color: var(--ink); font-weight: 600; }
+  .virt { color: var(--faint); font-size: 11px; border: 1px dashed var(--edge2); border-radius: 4px; padding: 0 5px; margin-left: 8px; font-weight: 400; }
+  .k-folder { color: var(--amber); } .k-image { color: var(--k-image); } .k-video { color: var(--k-video); }
+  .k-audio { color: var(--k-audio); } .k-pdf { color: var(--k-pdf); } .k-text { color: var(--k-text); }
+  .k-archive { color: var(--k-archive); } .k-binary, .k-file { color: var(--k-binary); }
+
+  .files.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(128px, 1fr)); gap: 8px; padding: 12px 12px 30px; align-content: start; }
+  .files.grid .it { position: relative; display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 10px 8px 8px; border-radius: 9px; border: 1px solid transparent; user-select: none; min-width: 0; }
+  .files.grid .it.sel { border-color: var(--sel-edge); }
+  .files.grid .it .ck { position: absolute; top: 6px; left: 6px; }
+  .files.grid .thumb { width: 100%; aspect-ratio: 4/3; display: flex; align-items: center; justify-content: center; border-radius: 6px; background: var(--panel2); overflow: hidden; }
+  .files.grid .thumb svg.ic { width: 40px; height: 40px; stroke-width: 1.3; }
+  .files.grid .thumb img { width: 100%; height: 100%; object-fit: contain; }
+  .files.grid .nm { width: 100%; text-align: center; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .files.grid .sz { font-size: 11px; color: var(--faint); }
+  .files.grid .mt { display: none; }
+
+  .empty { color: var(--faint); text-align: center; padding: 60px 20px; grid-column: 1 / -1; }
+  .empty svg.ic { width: 42px; height: 42px; display: block; margin: 0 auto 10px; stroke-width: 1.2; }
+  .empty b { color: var(--dim); font-weight: 600; }
+  .more { display: flex; justify-content: center; padding: 12px; grid-column: 1 / -1; }
+  .dropov { position: absolute; inset: 8px; border: 2px dashed var(--amber); border-radius: 12px; background: rgba(232,163,76,.07); display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 8px; color: var(--amber-hi); pointer-events: none; z-index: 5; font-size: 14px; text-align: center; padding: 20px; }
+  .dropov svg.ic { width: 38px; height: 38px; }
+
+  .status { display: flex; align-items: center; gap: 14px; padding: 4px 14px; border-top: 1px solid var(--edge); color: var(--faint); font-size: 12px; background: var(--panel); white-space: nowrap; overflow: hidden; min-height: 27px; }
+  .status b { color: var(--dim); font-weight: 600; }
+
+  /* ---------- preview ---------- */
+  .pv { border-left: 1px solid var(--edge); overflow: auto; background: rgba(13,17,25,.6); padding: 14px; min-width: 0; }
+  .pvh { display: flex; align-items: flex-start; gap: 10px; }
+  .pvh svg.ic { width: 28px; height: 28px; margin-top: 2px; }
+  .pvh .t { font-weight: 600; word-break: break-all; color: var(--ink); line-height: 1.4; }
+  .pvh .s { color: var(--faint); font-size: 12px; margin-top: 2px; }
+  .media { margin-top: 12px; border-radius: 8px; background: var(--panel2); border: 1px solid var(--edge); display: flex; align-items: center; justify-content: center; min-height: 120px; overflow: hidden; position: relative; }
+  .media img, .media video { max-width: 100%; max-height: 60vh; display: block; }
+  .media audio { width: 100%; margin: 14px; }
+  .media iframe { width: 100%; height: 60vh; border: 0; background: #fff; }
+  .media pre { margin: 0; border: 0; width: 100%; max-height: 60vh; overflow: auto; color: var(--ink); font-size: 12px; white-space: pre-wrap; word-break: break-word; align-self: stretch; }
+  .media .msg { color: var(--faint); font-size: 12.5px; text-align: center; padding: 18px; }
+  .media .msg button { margin-top: 10px; }
+  .media .big { color: var(--faint); }
+  .media .big svg.ic { width: 56px; height: 56px; stroke-width: 1.1; }
+  .prog { height: 3px; background: var(--edge); border-radius: 2px; overflow: hidden; width: 100%; }
+  .prog i { display: block; height: 100%; background: var(--amber); width: 0; transition: width .2s; }
+  .prog.ind i { width: 35% !important; animation: ind 1.2s ease-in-out infinite; }
+  @keyframes ind { from { transform: translateX(-100%); } to { transform: translateX(290%); } }
+  .media .prog { position: absolute; left: 0; right: 0; bottom: 0; border-radius: 0; }
+  dl.meta { display: grid; grid-template-columns: auto minmax(0,1fr); gap: 4px 12px; font-size: 12px; margin: 14px 0 0; }
+  dl.meta dt { color: var(--faint); }
+  dl.meta dd { margin: 0; color: var(--dim); word-break: break-all; }
+  .pvact { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 14px; }
+  .pvact .ib { border-color: var(--edge2); }
+  .pvnote { margin-top: 14px; color: var(--faint); font-size: 12px; border-top: 1px solid var(--edge); padding-top: 10px; }
+
+  /* ---------- menus, dialogs, viewer, jobs ---------- */
+  .menu { position: fixed; z-index: 50; min-width: 200px; background: #121722; border: 1px solid var(--edge2); border-radius: 9px; padding: 5px; box-shadow: 0 12px 40px rgba(0,0,0,.55); font-size: 12.5px; }
+  .menu button { display: flex; width: 100%; align-items: center; gap: 10px; background: transparent; color: var(--ink); border: 0; border-radius: 6px; padding: 6px 10px; font: 12.5px var(--mono); text-align: left; letter-spacing: 0; }
+  .menu button:hover:not(:disabled), .menu button:focus-visible { background: var(--sel); outline: none; }
+  .menu button.dangerous { color: #f08a8a; }
+  .menu button.dangerous:hover { background: var(--red); color: #fff; }
+  .menu button kbd { margin-left: auto; color: var(--faint); font: 11px var(--mono); }
+  .menu hr { border: 0; border-top: 1px solid var(--edge); margin: 4px 2px; }
+  .menu svg.ic { width: 15px; height: 15px; color: var(--dim); }
+
+  dialog { background: var(--panel); color: var(--ink); border: 1px solid var(--edge2); border-radius: 12px; padding: 0; width: min(560px, calc(100vw - 32px)); max-height: calc(100vh - 40px); box-shadow: 0 20px 60px rgba(0,0,0,.6); }
+  dialog::backdrop { background: rgba(5,7,11,.65); backdrop-filter: blur(2px); }
+  .dlg { padding: 18px 20px; font-size: 13px; }
+  .dlg h3 { margin: 0 0 10px; font-size: 15px; color: var(--ink); }
+  .dlg .body { color: var(--dim); }
+  .dlg .body ul { margin: 8px 0; padding-left: 18px; max-height: 160px; overflow: auto; }
+  .dlg .fld { display: flex; gap: 8px; margin-top: 12px; }
+  .dlg .fld input { flex: 1; }
+  .dlg .btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; flex-wrap: wrap; }
+  .dlg .card { margin-top: 0; border: 0; padding: 0; background: transparent; }
+  .dlg.wide { max-width: none; }
+
+  .viewer { position: fixed; inset: 0; z-index: 40; background: rgba(5,7,11,.94); display: grid; grid-template-rows: auto 1fr; }
+  .viewer .vh { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--edge); min-width: 0; }
+  .viewer .vh .t { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .viewer .vh .s { color: var(--faint); white-space: nowrap; }
+  .viewer .vb { position: relative; display: flex; align-items: center; justify-content: center; min-height: 0; padding: 16px 64px; }
+  .viewer .media { margin: 0; width: 100%; height: 100%; background: transparent; border: 0; }
+  .viewer .media img, .viewer .media video { max-height: calc(100vh - 110px); max-width: 100%; }
+  .viewer .media iframe { height: calc(100vh - 110px); }
+  .viewer .media pre { max-height: calc(100vh - 110px); max-width: 1100px; align-self: center; background: var(--panel2); border: 1px solid var(--edge); border-radius: 8px; }
+  .viewer .nav { position: absolute; top: 50%; transform: translateY(-50%); width: 44px; height: 64px; display: flex; align-items: center; justify-content: center; border-radius: 10px; background: rgba(16,20,29,.7); color: var(--dim); border: 1px solid var(--edge2); padding: 0; }
+  .viewer .nav:hover:not(:disabled) { color: var(--ink); background: var(--panel); }
+  .viewer .nav.l { left: 10px; } .viewer .nav.r { right: 10px; }
+  .viewer .nav svg.ic { width: 24px; height: 24px; }
+
+  .jobs { position: fixed; right: 16px; bottom: 40px; width: min(400px, calc(100vw - 32px)); z-index: 30; background: #121722; border: 1px solid var(--edge2); border-radius: 11px; box-shadow: 0 14px 44px rgba(0,0,0,.55); overflow: hidden; font-size: 12.5px; }
+  .jobs .jh { display: flex; align-items: center; gap: 6px; padding: 8px 8px 8px 14px; border-bottom: 1px solid var(--edge); }
+  .jobs .jh b { flex: 1; font-weight: 600; }
+  .jobs.min .jl { display: none; }
+  .jobs.min .jh { border-bottom: 0; }
+  .jobs .jl { max-height: 300px; overflow: auto; }
+  .job { padding: 8px 12px 9px 14px; border-bottom: 1px solid var(--edge); display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 3px 8px; align-items: center; }
+  .job:last-child { border-bottom: 0; }
+  .job .jt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .job .js { color: var(--faint); font-size: 11.5px; grid-column: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .job .prog { grid-column: 1 / -1; margin-top: 3px; }
+  .job.done .js { color: var(--green); }
+  .job.err .js { color: var(--red); white-space: normal; }
+  .job.done .prog, .job.err .prog, .job.cancelled .prog { display: none; }
+  .job .jx { grid-row: 1 / span 2; grid-column: 2; padding: 3px; }
+  .job .jx svg.ic { width: 14px; height: 14px; }
+
+  .toast { position: fixed; left: 50%; bottom: 46px; transform: translateX(-50%); background: #121722; border: 1px solid var(--edge2); border-radius: 8px; padding: 8px 14px; z-index: 60; font-size: 12.5px; box-shadow: 0 8px 30px rgba(0,0,0,.5); max-width: calc(100vw - 32px); }
+  .toast.bad { border-color: var(--red); color: #f2a3a3; }
+
+  .mob { display: none !important; }
+  @media (max-width: 1320px) { .ib .lb.opt { display: none; } }
+  @media (max-width: 1100px) {
+    .ex { grid-template-columns: 210px minmax(0, 1fr) 280px; }
+    .ex.nopv { grid-template-columns: 210px minmax(0, 1fr); }
+  }
+  @media (max-width: 820px) {
+    .mob { display: inline-flex !important; }
+    .desk { display: none !important; }
+    .ex, .ex.nopv { grid-template-columns: minmax(0, 1fr); }
+    .pv { display: none; }
+    .side { position: fixed; left: 0; top: 0; bottom: 0; width: 270px; z-index: 35; box-shadow: 10px 0 40px rgba(0,0,0,.6); transform: translateX(-105%); transition: transform .15s; background: var(--panel); }
+    .side.open { transform: none; }
+    .lhead, .files.list .it { grid-template-columns: 26px minmax(0,1fr) 80px; padding: 0 10px; }
+    .lhead .mtc, .files.list .it .mt { display: none; }
+    .files.list .it { min-height: 40px; }
+    .ib .lb { display: none; }
+    .bar { flex-wrap: nowrap; gap: 2px; }
+    .crumbs { flex: 1 1 0; }
+    #nb-fwd { display: none; }
+    .top .mark { display: none; }
+    .viewer .vb { padding: 10px; }
+    .viewer .nav { display: none; }
+    #locked .card { padding: 14px 14px; }
+  }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H9l2 2h7.5A2.5 2.5 0 0 1 21 9.5v8a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z"/></symbol>
+  <symbol id="i-bucket" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></symbol>
+  <symbol id="i-text" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M8.5 13h7M8.5 16.5h5"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2.5"/><circle cx="9" cy="9" r="2"/><path d="M21 15.5 16 10.5 5 21"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><rect x="2.5" y="6" width="13.5" height="12" rx="2"/><path d="m16 10.5 5.5-3v9l-5.5-3z"/></symbol>
+  <symbol id="i-audio" viewBox="0 0 24 24"><path d="M9 18V5.5l11-2V16"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="17.5" cy="16" r="2.5"/></symbol>
+  <symbol id="i-pdf" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><path d="M8.5 17v-4h1.3a1.2 1.2 0 0 1 0 2.4H8.5M13 17v-4h.8a2 2 0 0 1 0 4zM17 13h-1.6v4M15.4 15h1.3"/></symbol>
+  <symbol id="i-archive" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M10 4v1.5M10 7.5V9M10 11v1.5"/><rect x="8.5" y="14" width="3" height="4" rx=".8"/></symbol>
+  <symbol id="i-binary" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><path d="m10 12-2 2.5 2 2.5M14 12l2 2.5-2 2.5"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M15 18 9 12l6-6"/></symbol>
+  <symbol id="i-fwd" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+  <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 19V5M5.5 11.5 12 5l6.5 6.5"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20.5 12a8.5 8.5 0 1 1-2.6-6.1L20.5 8.5"/><path d="M20.5 3.5v5h-5"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 15.5V4M7 9l5-5 5 5M4 15v3.5A2.5 2.5 0 0 0 6.5 21h11a2.5 2.5 0 0 0 2.5-2.5V15"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11.5M7 10.5l5 5 5-5M4 15v3.5A2.5 2.5 0 0 0 6.5 21h11a2.5 2.5 0 0 0 2.5-2.5V15"/></symbol>
+  <symbol id="i-newfolder" viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H9l2 2h7.5A2.5 2.5 0 0 1 21 9.5v8a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z"/><path d="M12 10.5v6M9 13.5h6"/></symbol>
+  <symbol id="i-rename" viewBox="0 0 24 24"><path d="M4 20h4.5L19.5 9a2.1 2.1 0 0 0-3-3L5.5 17 4 20z"/><path d="m14.5 7.5 2 2"/></symbol>
+  <symbol id="i-move" viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H9l2 2h7.5A2.5 2.5 0 0 1 21 9.5v8a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z"/><path d="M8.5 13.5h7M13 11l2.5 2.5L13 16"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8.5" y="8.5" width="12" height="12" rx="2"/><path d="M15.5 8.5V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7.5a2 2 0 0 0 2 2h2.5"/></symbol>
+  <symbol id="i-cut" viewBox="0 0 24 24"><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M8 16.5 19 4M16 16.5 5 4"/></symbol>
+  <symbol id="i-paste" viewBox="0 0 24 24"><path d="M9 4.5H6.5A2 2 0 0 0 4.5 6.5v12a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-12a2 2 0 0 0-2-2H15"/><rect x="9" y="3" width="6" height="3.5" rx="1"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9.5 7V4.5h5V7M6 7l1 13h10l1-13M10 11v5.5M14 11v5.5"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><path d="M9 6h11M9 12h11M9 18h11M4.5 6h.01M4.5 12h.01M4.5 18h.01"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="4" y="4" width="6.5" height="6.5" rx="1.5"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.5"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.5"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.5"/></symbol>
+  <symbol id="i-panel" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M14.5 4v16"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.5 4.5"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+  <symbol id="i-car" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+  <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 14a4.5 4.5 0 0 0 6.4 0l3-3a4.5 4.5 0 0 0-6.4-6.4l-1 1"/><path d="M14 10a4.5 4.5 0 0 0-6.4 0l-3 3a4.5 4.5 0 0 0 6.4 6.4l1-1"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9.5" rx="2"/><path d="M8.5 11V8a3.5 3.5 0 0 1 7 0v3"/></symbol>
+  <symbol id="i-plug" viewBox="0 0 24 24"><path d="M9 3v5M15 3v5M6.5 8h11v3a5.5 5.5 0 0 1-11 0zM12 16.5V21"/></symbol>
+  <symbol id="i-expand" viewBox="0 0 24 24"><path d="M4 9V4h5M20 15v5h-5M15 4h5v5M9 20H4v-5"/></symbol>
+  <symbol id="i-open" viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H9l2 2h7.5A2.5 2.5 0 0 1 21 9.5v1H8.5L5.5 20H5.5A2.5 2.5 0 0 1 3 17.5z"/><path d="M8.5 10.5H22L19 20H5.5"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+</svg>
+
+<!-- ================= locked: status, connect, open ================= -->
+<div id="locked">
+<main>
+  <header>
+    <img src="/logo.svg" alt="">
+    <div class="mark">sia <b>s3</b></div>
+    <div class="tag">an S3 endpoint backed by Sia, served from an attested enclave</div>
+  </header>
+
+  <section class="card">
+    <h2>FILES</h2>
+    <div id="login">
+      <div class="note" style="margin-top:0">
+        Open the file explorer with this deployment's S3 keys. Requests are signed in this page (SigV4, WebCrypto):
+        the keys never leave the page, only signatures are sent.
+      </div>
+      <div class="row">
+        <input type="text" id="ak" placeholder="access key id" autocomplete="off" spellcheck="false">
+        <input type="password" id="sk" placeholder="secret access key" autocomplete="off">
+        <button id="unlock">open</button>
+      </div>
+      <div class="row">
+        <label class="chk"><input type="checkbox" id="remember"> keep the keys for this tab</label>
+      </div>
+    </div>
+    <div class="err hidden" id="err"></div>
+  </section>
+
+  <section class="card">
+    <h2>STATUS</h2>
+    <div id="status-slot"><div id="status-body">
+      <div class="kv">
+        <span>state <b id="state">…</b></span>
+        <span>version <b id="version">…</b></span>
+        <span>keys <b id="keys">…</b></span>
+        <span>stored <b id="bytes">…</b></span>
+        <span>sia objects <b id="objects">…</b></span>
+        <span>open uploads <b id="uploads">…</b></span>
+      </div>
+      <div class="kv" style="margin-top:6px">
+        <span>indexer <b><a id="indexer" target="_blank" rel="noopener noreferrer">…</a></b></span>
+        <span>region <b id="region">…</b></span>
+      </div>
+      <table id="buckets" class="bt">
+        <thead><tr><th>bucket</th><th>keys</th><th>size</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="err hidden" id="booterr"></div>
+    </div></div>
+  </section>
+
+  <section class="card">
+    <h2>CONNECT</h2>
+    <div id="connect-slot"><div id="connect-body">
+      <div class="kv">
+        <span>endpoint <b id="endpoint">…</b><button class="copy" data-copy="endpoint">copy</button></span>
+        <span>region <b id="region2">…</b></span>
+        <span>addressing <b>path-style</b></span>
+      </div>
+      <div class="note">
+        Any S3 client works: SigV4, ranges, copy, multipart, ListObjectsV2. The access keys are this
+        deployment's <b>S3_ACCESS_KEY_ID</b> and <b>S3_SECRET_ACCESS_KEY</b> secrets.
+      </div>
+      <pre id="snip-aws"></pre>
+      <pre id="snip-rclone"></pre>
+    </div></div>
+  </section>
+
+  <footer>
+    Objects are encrypted and erasure-coded inside the enclave and spread across independent Sia hosts:
+    any 10 of 30 shards rebuild an object, so no host can read the data and losing hosts loses nothing.
+    The key index lives in the objects' own sealed metadata, so the app keeps no local state.
+  </footer>
+</main>
+</div>
+
+<!-- ================= explorer ================= -->
+<div id="app" class="hidden">
+  <div class="top">
+    <button class="ib mob" id="side-btn" title="Folders" aria-label="Folders"></button>
+    <img src="/logo.svg" alt="">
+    <span class="mark">sia <b>s3</b></span>
+    <button class="pill" id="pill" title="Status"><i class="dot" id="pill-dot"></i><span id="pill-text">…</span></button>
+    <span class="grow"></span>
+    <button class="ib" id="connect-btn" title="Connect an S3 client"></button>
+    <button class="ib" id="lock" title="Forget the keys and close the explorer"></button>
+  </div>
+
+  <div class="bar" role="toolbar" aria-label="Navigation">
+    <button class="ib" id="nb-back" title="Back (Alt+←)" aria-label="Back"></button>
+    <button class="ib" id="nb-fwd" title="Forward (Alt+→)" aria-label="Forward"></button>
+    <button class="ib" id="nb-up" title="Up a folder (Backspace)" aria-label="Up"></button>
+    <button class="ib" id="nb-refresh" title="Refresh" aria-label="Refresh"></button>
+    <nav class="crumbs" id="crumbs" aria-label="Path"></nav>
+    <label class="filter desk"><input type="search" id="filter" placeholder="Filter this folder" aria-label="Filter this folder" spellcheck="false"></label>
+    <select id="sortsel" class="hidden" aria-label="Sort by" style="padding:4px 8px;font-size:12px">
+      <option value="name">name</option><option value="size">size</option><option value="mtime">modified</option>
+    </select>
+    <button class="ib" id="vb-list" title="List view" aria-label="List view"></button>
+    <button class="ib" id="vb-grid" title="Grid view" aria-label="Grid view"></button>
+    <button class="ib desk" id="vb-pv" title="Preview pane" aria-label="Preview pane"></button>
+  </div>
+
+  <div class="ex" id="ex">
+    <aside class="side" id="side" aria-label="Folders">
+      <h3>BUCKETS</h3>
+      <div id="tree" role="tree"></div>
+    </aside>
+
+    <section class="main" id="main">
+      <div class="bar" role="toolbar" aria-label="Actions">
+        <button class="ib primary" id="ab-upload" title="Upload files here"></button>
+        <button class="ib" id="ab-upfolder" title="Upload a folder here"></button>
+        <button class="ib" id="ab-newfolder" title="New folder"></button>
+        <span class="sep"></span>
+        <button class="ib" id="ab-download" title="Download"></button>
+        <button class="ib" id="ab-rename" title="Rename (F2)"></button>
+        <button class="ib" id="ab-move" title="Move to…"></button>
+        <button class="ib" id="ab-copy" title="Copy to…"></button>
+        <button class="ib dangerous" id="ab-delete" title="Delete (Del)"></button>
+        <input type="file" id="upfile" multiple class="hidden">
+        <input type="file" id="updir" webkitdirectory multiple class="hidden">
+      </div>
+      <div class="lhead" id="lhead">
+        <span></span>
+        <button data-sort="name">name</button>
+        <button data-sort="size" class="r">size</button>
+        <button data-sort="mtime" class="mtc">modified</button>
+      </div>
+      <div class="files list" id="files" tabindex="0" role="listbox" aria-multiselectable="true" aria-label="Files"></div>
+      <div class="dropov hidden" id="dropov"></div>
+    </section>
+
+    <aside class="pv" id="pv" aria-label="Preview"></aside>
+  </div>
+
+  <div class="status" id="statusbar"><span id="sb-left"></span><span class="grow"></span><span id="sb-right"></span></div>
+</div>
+
+<div class="jobs hidden" id="jobs">
+  <div class="jh"><b id="jobs-title">Transfers</b>
+    <button class="ib" id="jobs-clear" title="Clear finished">clear</button>
+    <button class="ib" id="jobs-min" title="Minimise" aria-label="Minimise"></button>
+  </div>
+  <div class="jl" id="jobs-list"></div>
+</div>
+
+<dialog id="dlg"></dialog>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const enc = new TextEncoder();
+const ORIGIN = location.origin, HOST = location.host;
+const SVGNS = "http://www.w3.org/2000/svg";
+let REGION = "auto";
+
+// Sizes. A single PUT must fit the server's body cap (64 MiB by default); larger files go multipart in 40 MiB parts
+// (one Sia slab of data each). Previews download whole objects, so they are capped.
+const SINGLE_MAX = 48 << 20, PART = 40 << 20;
+const FOLDER_CAP = 10000;
+const CAP = { image: 32 << 20, video: 256 << 20, audio: 128 << 20, pdf: 64 << 20 };
+const TEXT_MAX = 256 << 10, THUMB_MAX = 4 << 20;
+const PENDING_WAIT_MS = 20 * 60e3, POLL_MS = 15e3;
+
+// ---------------- small helpers ----------------
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+function icon(name, cls) {
+  const s = document.createElementNS(SVGNS, "svg"); s.setAttribute("class", "ic" + (cls ? " " + cls : "")); s.setAttribute("aria-hidden", "true");
+  const u = document.createElementNS(SVGNS, "use"); u.setAttribute("href", "#i-" + name); s.appendChild(u); return s;
+}
+function ibtn(id, ic, label, opt) { const b = $(id); b.textContent = ""; b.appendChild(icon(ic)); if (label) b.appendChild(el("span", "lb" + (opt ? " opt" : ""), label)); if (label && !b.getAttribute("aria-label")) b.setAttribute("aria-label", b.title || label); }
+function fmtBytes(n) {
+  if (n == null || isNaN(n)) return "–";
+  const u = ["B", "KiB", "MiB", "GiB", "TiB"]; let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i ? n.toFixed(n < 10 ? 2 : 1) : n) + " " + u[i];
+}
+const p2 = (n) => String(n).padStart(2, "0");
+const fmtDate = (ms) => { if (!ms) return ""; const d = new Date(ms); return d.getFullYear() + "-" + p2(d.getMonth() + 1) + "-" + p2(d.getDate()) + " " + p2(d.getHours()) + ":" + p2(d.getMinutes()); };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function show(e, on) { e.classList.toggle("hidden", !on); }
+function setErr(msg) { $("err").textContent = msg || ""; show($("err"), !!msg); }
+const lsGet = (k, d) => { try { const v = localStorage.getItem("sia-s3:" + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } };
+const lsSet = (k, v) => { try { localStorage.setItem("sia-s3:" + k, JSON.stringify(v)); } catch (e) {} };
+let toastT = 0;
+function toast(msg, bad) {
+  document.querySelectorAll(".toast").forEach((t) => t.remove());
+  const t = el("div", "toast" + (bad ? " bad" : ""), msg); document.body.appendChild(t);
+  clearTimeout(toastT); toastT = setTimeout(() => t.remove(), bad ? 6000 : 2600);
+}
+function copyText(s, what) { navigator.clipboard.writeText(s).then(() => toast("Copied " + (what || ""))).catch(() => toast("Copy failed", true)); }
+const parentOf = (p) => { const t = p.endsWith("/") ? p.slice(0, -1) : p; const i = t.lastIndexOf("/"); return i < 0 ? "" : t.slice(0, i + 1); };
+const baseName = (p) => { const t = p.endsWith("/") ? p.slice(0, -1) : p; return t.slice(t.lastIndexOf("/") + 1); };
+
+// ---------------- file kinds ----------------
+const EXT = {};
+for (const [k, list] of Object.entries({
+  image: "png jpg jpeg jfif gif webp avif bmp ico svg",
+  video: "mp4 m4v webm mov ogv",
+  audio: "mp3 wav ogg oga opus flac m4a aac",
+  pdf: "pdf",
+  text: "txt text md markdown json jsonl ndjson js mjs cjs ts tsx jsx css scss less html htm xml yml yaml toml ini conf cfg env csv tsv log sh bash zsh fish ps1 bat py rs go c h cc cpp hpp java kt kts rb php sql lua swift dart vue svelte gitignore dockerfile makefile license readme lock diff patch srt vtt tex rst",
+  archive: "zip tar gz tgz bz2 xz zst 7z rar car br",
+  binary: "wasm bin exe dll so dylib o a iso img dmg deb rpm apk class jar pyc",
+})) for (const e of list.split(" ")) EXT[e] = k;
+const MIME = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", jfif: "image/jpeg", gif: "image/gif", webp: "image/webp", avif: "image/avif",
+  bmp: "image/bmp", ico: "image/x-icon", svg: "image/svg+xml", mp4: "video/mp4", m4v: "video/mp4", webm: "video/webm",
+  mov: "video/quicktime", ogv: "video/ogg", mp3: "audio/mpeg", wav: "audio/wav", ogg: "audio/ogg", oga: "audio/ogg", opus: "audio/ogg",
+  flac: "audio/flac", m4a: "audio/mp4", aac: "audio/aac", pdf: "application/pdf", json: "application/json", txt: "text/plain",
+  html: "text/html", htm: "text/html", css: "text/css", js: "text/javascript", mjs: "text/javascript", md: "text/markdown",
+  csv: "text/csv", xml: "application/xml", wasm: "application/wasm", zip: "application/zip", gz: "application/gzip",
+};
+function extOf(name) {
+  const b = baseName(name).toLowerCase(), d = b.lastIndexOf(".");
+  return d > 0 ? b.slice(d + 1) : (EXT[b] ? b : "");
+}
+function kindOf(name, ct) {
+  const k = EXT[extOf(name)];
+  if (k) return k;
+  ct = (ct || "").toLowerCase();
+  if (!ct || ct === "application/octet-stream") return "";
+  if (ct.startsWith("image/")) return "image";
+  if (ct.startsWith("video/")) return "video";
+  if (ct.startsWith("audio/")) return "audio";
+  if (ct === "application/pdf") return "pdf";
+  if (ct.startsWith("text/") || /json|xml|javascript|yaml|toml/.test(ct)) return "text";
+  if (/zip|gzip|tar|7z|compress|rar/.test(ct)) return "archive";
+  return "";
+}
+const ICON = { image: "image", video: "video", audio: "audio", pdf: "pdf", text: "text", archive: "archive", binary: "binary" };
+const iconFor = (it) => (it.dir ? icon("folder", "k-folder") : icon(ICON[it.kind] || "file", "k-" + (it.kind || "file")));
+// Content sniffing, for keys without an extension (the ipfs bucket is all pins/<cid>).
+function sniff(b) {
+  const at = (o, s) => b.length >= o + s.length && [...s].every((c, i) => b[o + i] === c.charCodeAt(0));
+  if (b[0] === 0x89 && at(1, "PNG")) return ["image", "image/png"];
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return ["image", "image/jpeg"];
+  if (at(0, "GIF8")) return ["image", "image/gif"];
+  if (at(0, "RIFF") && at(8, "WEBP")) return ["image", "image/webp"];
+  if (at(0, "RIFF") && at(8, "WAVE")) return ["audio", "audio/wav"];
+  if (at(4, "ftyp")) {
+    const brand = String.fromCharCode(...b.slice(8, 12));
+    if (/^avi[fs]/.test(brand)) return ["image", "image/avif"];
+    if (/^M4A/.test(brand)) return ["audio", "audio/mp4"];
+    if (/^qt/.test(brand)) return ["video", "video/quicktime"];
+    return ["video", "video/mp4"];
+  }
+  if (b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3) return ["video", "video/webm"];
+  if (at(0, "%PDF")) return ["pdf", "application/pdf"];
+  if (at(0, "OggS")) return ["audio", "audio/ogg"];
+  if (at(0, "fLaC")) return ["audio", "audio/flac"];
+  if (at(0, "ID3")) return ["audio", "audio/mpeg"];
+  if (at(0, "PK\x03\x04") || (b[0] === 0x1f && b[1] === 0x8b) || at(0, "7z\xbc\xaf") || at(0, "Rar!") || at(257, "ustar")) return ["archive", ""];
+  if (b[0] === 0 && at(1, "asm")) return ["binary", "application/wasm"];
+  const t = new TextDecoder("utf-8").decode(b);
+  let bad = 0; for (const ch of t) { const c = ch.charCodeAt(0); if (c === 0xfffd || (c < 32 && c !== 9 && c !== 10 && c !== 13 && c !== 12)) bad++; }
+  if (t.length && bad <= Math.max(1, t.length / 200) && !t.includes("\0")) {
+    if (/^\s*(<\?xml[^>]*>\s*)?(<!--[\s\S]*?-->\s*)*<svg[\s>]/i.test(t)) return ["image", "image/svg+xml"];
+    return ["text", "text/plain"];
+  }
+  return ["binary", ""];
+}
+
+// ---------------- MD5 (S3 ETags), for uploads whose response the gateway dropped ----------------
+const MD5K = new Int32Array(64).map((_, i) => Math.floor(Math.abs(Math.sin(i + 1)) * 2 ** 32) | 0);
+const MD5S = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
+function md5hex(u8) {
+  let a0 = 0x67452301, b0 = 0xefcdab89 | 0, c0 = 0x98badcfe | 0, d0 = 0x10325476;
+  const M = new Int32Array(16);
+  const block = (s, off) => {
+    for (let i = 0; i < 16; i++) { const j = off + i * 4; M[i] = s[j] | (s[j + 1] << 8) | (s[j + 2] << 16) | (s[j + 3] << 24); }
+    let A = a0, B = b0, C = c0, D = d0;
+    for (let i = 0; i < 64; i++) {
+      let F, g;
+      if (i < 16) { F = (B & C) | (~B & D); g = i; }
+      else if (i < 32) { F = (D & B) | (~D & C); g = (5 * i + 1) & 15; }
+      else if (i < 48) { F = B ^ C ^ D; g = (3 * i + 5) & 15; }
+      else { F = C ^ (B | ~D); g = (7 * i) & 15; }
+      F = (F + A + MD5K[i] + M[g]) | 0;
+      A = D; D = C; C = B;
+      const r = MD5S[(i >> 4) * 4 + (i & 3)];
+      B = (B + ((F << r) | (F >>> (32 - r)))) | 0;
+    }
+    a0 = (a0 + A) | 0; b0 = (b0 + B) | 0; c0 = (c0 + C) | 0; d0 = (d0 + D) | 0;
+  };
+  const n = u8.length, full = n - (n % 64);
+  for (let off = 0; off < full; off += 64) block(u8, off);
+  const tail = new Uint8Array(n - full < 56 ? 64 : 128);
+  tail.set(u8.subarray(full)); tail[n - full] = 0x80;
+  const lo = (n * 8) >>> 0, hi = Math.floor(n / 2 ** 29) >>> 0, L = tail.length - 8;
+  for (let i = 0; i < 4; i++) { tail[L + i] = (lo >>> (8 * i)) & 255; tail[L + 4 + i] = (hi >>> (8 * i)) & 255; }
+  for (let off = 0; off < tail.length; off += 64) block(tail, off);
+  return [a0, b0, c0, d0].map((w) => [0, 8, 16, 24].map((s) => ((w >>> s) & 255).toString(16).padStart(2, "0")).join("")).join("");
+}
+
+// ---------------- status ----------------
+let lastStatus = null;
+async function status() {
+  let s;
+  try { s = await (await fetch("/api/status", { cache: "no-store" })).json(); }
+  catch (e) {
+    $("state").textContent = "unreachable"; $("state").className = "state-bad";
+    $("pill-dot").className = "dot bad"; $("pill-text").textContent = "unreachable"; return;
+  }
+  lastStatus = s;
+  REGION = s.region || "auto";
+  $("version").textContent = s.version;
+  $("region").textContent = REGION; $("region2").textContent = REGION;
+  $("indexer").textContent = (s.indexer || "").replace(/^https?:\/\//, "");
+  $("indexer").href = s.indexer || "#";
+  $("state").textContent = s.ready ? "ready" : "starting";
+  $("state").className = s.ready ? "state-ready" : "state-busy";
+  $("booterr").textContent = !s.ready && s.bootError ? "last start attempt: " + s.bootError : "";
+  show($("booterr"), !s.ready && !!s.bootError);
+  const bs = s.buckets || [];
+  const keys = bs.reduce((a, b) => a + (b.keys || 0), 0), bytes = bs.reduce((a, b) => a + (b.bytes || 0), 0);
+  $("keys").textContent = s.ready ? keys.toLocaleString() : "–";
+  $("bytes").textContent = s.ready ? fmtBytes(bytes) : "–";
+  $("objects").textContent = s.ready ? (s.objects || 0).toLocaleString() : "–";
+  $("uploads").textContent = s.ready ? (s.openUploads || 0) : "–";
+  const tb = $("buckets").querySelector("tbody"); tb.textContent = "";
+  for (const b of bs) {
+    const tr = document.createElement("tr");
+    for (const v of [b.name, s.ready ? (b.keys || 0).toLocaleString() : "–", s.ready ? fmtBytes(b.bytes || 0) : "–"]) tr.appendChild(el("td", "", v));
+    tb.appendChild(tr);
+  }
+  $("pill-dot").className = "dot " + (s.ready ? "ok" : "busy");
+  $("pill-text").textContent = s.ready ? `v${s.version} · ${keys.toLocaleString()} keys · ${fmtBytes(bytes)}` : `v${s.version} · starting`;
+  const first = bs[0] ? bs[0].name : "my-bucket";
+  $("endpoint").textContent = ORIGIN;
+  $("snip-aws").textContent =
+    "export AWS_ACCESS_KEY_ID=<S3_ACCESS_KEY_ID>\n" +
+    "export AWS_SECRET_ACCESS_KEY=<S3_SECRET_ACCESS_KEY>\n" +
+    "aws s3 ls s3://" + first + "/ --endpoint-url " + ORIGIN + " --region " + REGION;
+  $("snip-rclone").textContent =
+    "[sia]\ntype = s3\nprovider = Other\nendpoint = " + ORIGIN + "\nregion = " + REGION +
+    "\nforce_path_style = true\naccess_key_id = <S3_ACCESS_KEY_ID>\nsecret_access_key = <S3_SECRET_ACCESS_KEY>";
+}
+document.addEventListener("click", (e) => {
+  const id = e.target && e.target.dataset && e.target.dataset.copy;
+  if (!id) return;
+  navigator.clipboard.writeText($(id).textContent).then(() => {
+    e.target.textContent = "copied"; setTimeout(() => (e.target.textContent = "copy"), 1200);
+  });
+});
+
+// ---------------- SigV4 (same canonical form the server verifies) ----------------
+const hex = (buf) => Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
+async function sha256hex(data) { return hex(await crypto.subtle.digest("SHA-256", typeof data === "string" ? enc.encode(data) : data)); }
+async function hmac(key, msg) {
+  const k = await crypto.subtle.importKey("raw", typeof key === "string" ? enc.encode(key) : key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return crypto.subtle.sign("HMAC", k, enc.encode(msg));
+}
+// AWS URI encoding: everything but A-Z a-z 0-9 - _ . ~ (and "/" in paths)
+function awsEnc(s, keepSlash) {
+  let out = "";
+  for (const b of enc.encode(s)) {
+    const c = String.fromCharCode(b);
+    if (/[A-Za-z0-9\-_.~]/.test(c) || (keepSlash && c === "/")) out += c;
+    else out += "%" + b.toString(16).toUpperCase().padStart(2, "0");
+  }
+  return out;
+}
+let creds = null;
+const EMPTY_SHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+async function signed(method, bucket, key, query, hasBody, extraHeaders) {
+  if (!creds) throw new Error("no keys");
+  const path = "/" + (bucket ? awsEnc(bucket, false) : "") + (key ? "/" + awsEnc(key, true) : "");
+  const qs = Object.keys(query || {}).sort().map((k) => awsEnc(k) + "=" + awsEnc(String(query[k]))).join("&");
+  const now = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+  const day = now.slice(0, 8);
+  const payload = hasBody ? "UNSIGNED-PAYLOAD" : EMPTY_SHA;
+  const h = Object.assign({ "host": HOST, "x-amz-date": now, "x-amz-content-sha256": payload }, extraHeaders || {});
+  const names = Object.keys(h).map((n) => n.toLowerCase()).sort();
+  const lower = {}; for (const n of Object.keys(h)) lower[n.toLowerCase()] = String(h[n]).trim().split(/\s+/).join(" ");
+  const canonical = [method, path, qs, names.map((n) => n + ":" + lower[n] + "\n").join(""), names.join(";"), payload].join("\n");
+  const scope = day + "/" + REGION + "/s3/aws4_request";
+  const sts = "AWS4-HMAC-SHA256\n" + now + "\n" + scope + "\n" + (await sha256hex(canonical));
+  let k = await hmac("AWS4" + creds.sk, day);
+  for (const p of [REGION, "s3", "aws4_request"]) k = await hmac(k, p);
+  const sig = hex(await hmac(k, sts));
+  const headers = {};
+  for (const n of Object.keys(h)) if (n.toLowerCase() !== "host") headers[n] = h[n];
+  headers["Authorization"] = "AWS4-HMAC-SHA256 Credential=" + creds.ak + "/" + scope + ", SignedHeaders=" + names.join(";") + ", Signature=" + sig;
+  return { url: path + (qs ? "?" + qs : ""), headers };
+}
+async function s3(method, bucket, key, query, opts) {
+  opts = opts || {};
+  const { url, headers } = await signed(method, bucket, key, query, opts.body != null, opts.headers);
+  return fetch(url, { method, headers, body: opts.body, cache: "no-store", signal: opts.signal });
+}
+// XHR for uploads: fetch has no upload progress. Resolves (never rejects) with what happened.
+async function s3xhr(method, bucket, key, query, body, extraHeaders, onProgress, job) {
+  const { url, headers } = await signed(method, bucket, key, query, true, extraHeaders);
+  return new Promise((resolve) => {
+    const x = new XMLHttpRequest();
+    let sentAll = false;
+    x.open(method, url);
+    for (const h of Object.keys(headers)) x.setRequestHeader(h, headers[h]);
+    x.upload.onprogress = (e) => { if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total); };
+    x.upload.onload = () => { sentAll = true; if (onProgress) onProgress(1); };
+    x.onload = () => resolve({ status: x.status, ok: x.status >= 200 && x.status < 300, text: x.responseText, etag: x.getResponseHeader("ETag"), sentAll: true });
+    x.onerror = () => resolve({ status: 0, ok: false, text: "network error", sentAll });
+    x.onabort = () => resolve({ status: -1, ok: false, aborted: true, text: "cancelled" });
+    if (job) job.abort = () => x.abort();
+    x.send(body);
+  });
+}
+function errText(status, t) {
+  const m = (t || "").match(/<Code>([^<]*)<\/Code>[\s\S]*?<Message>([^<]*)<\/Message>/);
+  return "HTTP " + status + (m ? " " + m[1] + ": " + m[2] : t ? ": " + t.slice(0, 200) : "");
+}
+async function s3err(r) { return errText(r.status, await r.text()); }
+// The gateway in front of the app gives up on a request after a few minutes while the app keeps storing the
+// body on Sia: these mean "sent, outcome unknown", and the caller checks for the result instead.
+const gaveUp = (r) => [502, 504, 524].includes(r.status) || (r.status === 0 && r.sentAll);
+const xmlDoc = (t) => new DOMParser().parseFromString(t, "application/xml");
+const tagText = (e, name) => { const x = e.getElementsByTagName(name)[0]; return x ? x.textContent : ""; };
+const xmlEsc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+// ---------------- listing + cache ----------------
+const S = {
+  buckets: [], bucket: "", prefix: "", data: null, all: [], items: [], sel: new Set(), anchor: -1, cursor: -1,
+  sort: lsGet("sort", { by: "name", dir: 1 }), view: lsGet("view", "list"), pv: lsGet("pv", true), filter: "", gen: 0,
+  expanded: new Set(), clip: null, drag: null, loading: false, error: "",
+};
+const cache = new Map(), inflight = new Map();
+const virt = new Set(); // "bucket\nprefix/" folders made here that hold nothing yet (S3 has no empty folders)
+const cid = (b, p) => b + "\n" + p;
+
+async function listPage(bucket, prefix, delimiter, token) {
+  const q = { "list-type": "2", "max-keys": "1000" };
+  if (delimiter) q.delimiter = delimiter;
+  if (prefix) q.prefix = prefix;
+  if (token) q["continuation-token"] = token;
+  const r = await s3("GET", bucket, "", q);
+  if (!r.ok) throw new Error(await s3err(r));
+  const d = xmlDoc(await r.text());
+  const dirs = Array.from(d.getElementsByTagName("CommonPrefixes"), (c) => tagText(c, "Prefix"));
+  const files = Array.from(d.getElementsByTagName("Contents"), (c) => ({
+    key: tagText(c, "Key"), size: +tagText(c, "Size"), mtime: Date.parse(tagText(c, "LastModified")) || 0,
+    etag: tagText(c, "ETag").replace(/"/g, ""),
+  }));
+  return { dirs, files, next: tagText(d, "IsTruncated") === "true" ? tagText(d, "NextContinuationToken") : null };
+}
+function listFolder(bucket, prefix, force, more) {
+  const id = cid(bucket, prefix);
+  if (!force && !more && cache.has(id)) return Promise.resolve(cache.get(id));
+  if (inflight.has(id)) return inflight.get(id);
+  const p = (async () => {
+    const prev = more ? cache.get(id) : null;
+    const dirs = prev ? prev.dirs.slice() : [], files = prev ? prev.files.slice() : [];
+    let token = prev ? prev.token : null, n = 0;
+    do {
+      const r = await listPage(bucket, prefix, "/", token);
+      for (const d of r.dirs) if (!dirs.length || dirs[dirs.length - 1] !== d) dirs.push(d);
+      files.push(...r.files); token = r.next; n += r.dirs.length + r.files.length;
+    } while (token && n < FOLDER_CAP);
+    const v = { dirs, files, token, at: Date.now() };
+    cache.set(id, v);
+    for (const d of dirs) virt.delete(cid(bucket, d));
+    return v;
+  })().finally(() => inflight.delete(id));
+  inflight.set(id, p);
+  return p;
+}
+async function listAll(bucket, prefix, onCount) {
+  const out = []; let token = null;
+  do {
+    const r = await listPage(bucket, prefix, "", token);
+    out.push(...r.files); token = r.next;
+    if (onCount) onCount(out.length);
+  } while (token);
+  return out;
+}
+function invalidate(bucket) { for (const k of [...cache.keys()]) if (k.startsWith(bucket + "\n")) cache.delete(k); }
+function childDirs(bucket, prefix, data) {
+  const out = data ? data.dirs.slice() : [];
+  for (const v of virt) {
+    const [b, p] = v.split("\n");
+    if (b === bucket && parentOf(p) === prefix && !out.includes(p)) out.push(p);
+  }
+  return out.sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
+}
+
+// ---------------- navigation ----------------
+let navN = 0, navMax = 0;
+function encPath(b, p) { return [b, ...p.split("/")].map(encodeURIComponent).join("/"); }
+function parseHash() {
+  const h = location.hash;
+  if (!h.startsWith("#/")) return null;
+  const s = h.slice(2), i = s.indexOf("/");
+  try {
+    const b = decodeURIComponent(i < 0 ? s : s.slice(0, i));
+    const p = i < 0 ? "" : s.slice(i + 1).split("/").map(decodeURIComponent).join("/");
+    return { b, p: p && !p.endsWith("/") ? p + "/" : p };
+  } catch (e) { return null; }
+}
+function nav(b, p, replace) {
+  if (!replace && b === S.bucket && p === S.prefix) return refresh();
+  const st = { b, p, n: replace ? navN : navN + 1 };
+  if (replace) history.replaceState(st, "", "#/" + encPath(b, p)); else history.pushState(st, "", "#/" + encPath(b, p));
+  navN = st.n; navMax = replace ? Math.max(navMax, navN) : navN;
+  openFolder(b, p);
+}
+window.addEventListener("popstate", (e) => {
+  if (!creds) return;
+  const st = e.state && e.state.b != null ? e.state : parseHash();
+  if (!st) return;
+  navN = e.state && e.state.n != null ? e.state.n : 0;
+  if (S.buckets.includes(st.b)) openFolder(st.b, st.p);
+});
+function expandTo(b, p) {
+  S.expanded.add(cid(b, ""));
+  let acc = "";
+  for (const part of p.split("/").filter(Boolean).slice(0, -1)) { acc += part + "/"; S.expanded.add(cid(b, acc)); }
+}
+async function openFolder(b, p, keepSel) {
+  const same = b === S.bucket && p === S.prefix;
+  S.bucket = b; S.prefix = p;
+  if (!same || !keepSel) { S.sel.clear(); S.anchor = -1; S.cursor = -1; }
+  if (!same) { S.filter = ""; $("filter").value = ""; $("files").scrollTop = 0; }
+  expandTo(b, p);
+  renderCrumbs(); paintNav();
+  const gen = ++S.gen;
+  S.error = "";
+  // a refresh of the folder on screen keeps showing it until the new listing arrives
+  if (!cache.has(cid(b, p)) && !(same && S.data)) { S.loading = true; S.data = null; build(); render(); }
+  renderTree();
+  try {
+    const d = await listFolder(b, p);
+    if (gen !== S.gen) return;
+    S.loading = false; S.data = d;
+  } catch (e) {
+    if (gen !== S.gen) return;
+    S.loading = false; S.data = null; S.error = e.message;
+  }
+  build(); render(); renderTree();
+  $("side").classList.remove("open");
+  // load the tree's open branches that are not cached yet
+  for (const id of S.expanded) if (!cache.has(id)) { const [eb, ep] = id.split("\n"); listFolder(eb, ep).then(renderTree, () => {}); }
+}
+function refresh() {
+  if (!S.bucket) return;
+  invalidate(S.bucket);
+  return openFolder(S.bucket, S.prefix, true);
+}
+function paintNav() {
+  $("nb-back").disabled = navN <= 0;
+  $("nb-fwd").disabled = navN >= navMax;
+  $("nb-up").disabled = !S.prefix;
+}
+
+// ---------------- items ----------------
+function build() {
+  const all = [];
+  const d = S.data;
+  for (const p of childDirs(S.bucket, S.prefix, d)) {
+    all.push({ dir: true, id: p, key: p, name: baseName(p) || "/", virtual: !(d && d.dirs.includes(p)) });
+  }
+  if (d) for (const f of d.files) {
+    if (f.key === S.prefix) continue; // a "folder/" marker object is the folder itself
+    all.push({ dir: false, id: f.key, key: f.key, name: f.key.slice(S.prefix.length), size: f.size, mtime: f.mtime, etag: f.etag, kind: kindOf(f.key) });
+  }
+  S.all = all;
+  applyView();
+}
+function applyView() {
+  const q = S.filter.trim().toLowerCase();
+  const items = q ? S.all.filter((it) => it.name.toLowerCase().includes(q)) : S.all.slice();
+  const { by, dir } = S.sort;
+  const cmpName = (a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+  items.sort((a, b) => {
+    if (a.dir !== b.dir) return a.dir ? -1 : 1;
+    let c = 0;
+    if (by === "size" && !a.dir) c = a.size - b.size;
+    else if (by === "mtime" && !a.dir) c = a.mtime - b.mtime;
+    return (c || cmpName(a, b)) * dir;
+  });
+  S.items = items;
+  const ids = new Set(items.map((i) => i.id));
+  for (const id of [...S.sel]) if (!ids.has(id)) S.sel.delete(id);
+  if (S.cursor >= items.length) S.cursor = items.length - 1;
+}
+const selItems = () => S.items.filter((it) => S.sel.has(it.id));
+
+// ---------------- rendering ----------------
+function renderCrumbs() {
+  const c = $("crumbs"); c.textContent = "";
+  const parts = S.prefix.split("/").filter(Boolean);
+  const mk = (label, p, last) => {
+    const b = el("button", "cr" + (last ? " last" : ""), label);
+    b.title = S.bucket + "/" + p; b.dataset.p = p;
+    b.onclick = () => nav(S.bucket, p);
+    dropTarget(b, () => ({ b: S.bucket, p }));
+    return b;
+  };
+  const root = mk(S.bucket, "", !parts.length); root.prepend(icon("bucket")); root.style.display = "inline-flex"; root.style.alignItems = "center"; root.style.gap = "6px";
+  c.appendChild(root);
+  let acc = "";
+  parts.forEach((p, i) => { acc += p + "/"; c.appendChild(el("span", "slash", "/")); c.appendChild(mk(p, acc, i === parts.length - 1)); });
+  requestAnimationFrame(() => { c.scrollLeft = c.scrollWidth; });
+}
+function renderTree() {
+  const t = $("tree"); t.textContent = "";
+  const add = (b, p, depth) => {
+    const id = cid(b, p), data = cache.get(id), open = S.expanded.has(id);
+    const kids = data ? childDirs(b, p, data) : childDirs(b, p, null);
+    const row = el("div", "tn" + (b === S.bucket && p === S.prefix ? " cur" : ""));
+    row.setAttribute("role", "treeitem"); row.tabIndex = -1;
+    row.style.paddingLeft = 8 + depth * 14 + "px";
+    const car = el("span", "car" + (open ? " open" : "") + (data && !kids.length ? " leaf" : ""));
+    car.appendChild(icon("car"));
+    car.onclick = (e) => { e.stopPropagation(); toggleTree(b, p); };
+    row.append(car, icon(depth ? "folder" : "bucket", depth ? "k-folder" : "k-bucket"), el("span", "lbl", depth ? baseName(p) : b));
+    row.title = b + "/" + p;
+    row.onclick = () => nav(b, p);
+    row.ondblclick = () => toggleTree(b, p);
+    dropTarget(row, () => ({ b, p }));
+    t.appendChild(row);
+    if (!open) return;
+    if (!data && !kids.length) { const l = el("div", "tn loading", "loading…"); l.style.paddingLeft = 30 + depth * 14 + "px"; t.appendChild(l); return; }
+    for (const k of kids) add(b, k, depth + 1);
+  };
+  for (const b of S.buckets) add(b, "", 0);
+}
+function toggleTree(b, p) {
+  const id = cid(b, p);
+  if (S.expanded.has(id)) S.expanded.delete(id);
+  else { S.expanded.add(id); if (!cache.has(id)) listFolder(b, p).then(renderTree, (e) => toast(e.message, true)); }
+  renderTree();
+}
+
+let renderedFor = "";
+function render() {
+  const box = $("files"), here = cid(S.bucket, S.prefix) + "|" + S.view, top = renderedFor === here ? box.scrollTop : 0;
+  renderedFor = here;
+  requestAnimationFrame(() => { box.scrollTop = top; });
+  box.textContent = ""; thumbQ.length = 0; if (thumbObs) thumbObs.disconnect();
+  box.className = "files " + S.view;
+  show($("lhead"), S.view === "list");
+  show($("sortsel"), S.view === "grid");
+  $("sortsel").value = S.sort.by;
+  for (const b of $("lhead").querySelectorAll("[data-sort]")) {
+    const on = b.dataset.sort === S.sort.by;
+    b.classList.toggle("sorted", on);
+    b.textContent = b.dataset.sort === "mtime" ? "modified" : b.dataset.sort;
+    if (on) b.append(S.sort.dir > 0 ? " ↑" : " ↓");
+  }
+  $("vb-list").classList.toggle("on", S.view === "list");
+  $("vb-grid").classList.toggle("on", S.view === "grid");
+  $("vb-pv").classList.toggle("on", S.pv);
+  $("ex").classList.toggle("nopv", !S.pv);
+  if (S.loading) { box.appendChild(emptyMsg("refresh", "Loading…", "")); paintSel(); return; }
+  if (S.error) {
+    const m = emptyMsg("x", "Could not list this folder", S.error);
+    const r = el("button", "ghost", "retry"); r.style.marginTop = "12px"; r.onclick = refresh; m.appendChild(r);
+    box.appendChild(m); paintSel(); return;
+  }
+  if (!S.items.length) {
+    box.appendChild(S.filter ? emptyMsg("search", "Nothing matches “" + S.filter + "”", "")
+      : emptyMsg("upload", "This folder is empty", "Drop files or folders here, or use Upload."));
+    paintSel(); return;
+  }
+  const frag = document.createDocumentFragment();
+  S.items.forEach((it, i) => frag.appendChild(S.view === "grid" ? tile(it, i) : row(it, i)));
+  box.appendChild(frag);
+  if (S.data && S.data.token && !S.filter) {
+    const m = el("div", "more"); const b = el("button", "ghost", "load more (showing " + S.all.length.toLocaleString() + ")");
+    b.onclick = async () => { b.disabled = true; try { S.data = await listFolder(S.bucket, S.prefix, false, true); build(); render(); } catch (e) { toast(e.message, true); b.disabled = false; } };
+    m.appendChild(b); box.appendChild(m);
+  }
+  paintSel();
+  if (S.view === "grid") setupThumbs();
+}
+function emptyMsg(ic, title, sub) {
+  const d = el("div", "empty"); d.appendChild(icon(ic)); d.appendChild(el("b", "", title));
+  if (sub) d.appendChild(el("div", "", sub)); return d;
+}
+function nameNode(it) {
+  const n = el("span", "nm", it.name || "(empty name)");
+  n.title = it.key;
+  if (it.virtual) { const v = el("span", "virt", "empty"); v.title = "Exists only in this tab until a file is put in it"; n.appendChild(v); }
+  return n;
+}
+function itemShell(it, i) {
+  const d = el("div", "it" + (it.dir ? " dir" : ""));
+  d.dataset.i = i; d.setAttribute("role", "option"); d.draggable = true;
+  const ck = el("span", "ck"); const cb = el("input"); cb.type = "checkbox"; cb.tabIndex = -1; cb.setAttribute("aria-label", "select " + it.name);
+  ck.appendChild(cb); d.appendChild(ck);
+  if (S.clip && S.clip.mode === "move" && S.clip.b === S.bucket && S.clip.items.some((c) => c.id === it.id)) d.classList.add("cut");
+  return d;
+}
+function row(it, i) {
+  const d = itemShell(it, i);
+  const nw = el("span", "nmw"); nw.append(iconFor(it), nameNode(it));
+  const sz = el("span", "sz", it.dir ? "" : fmtBytes(it.size));
+  const mt = el("span", "mt", it.dir ? "" : fmtDate(it.mtime)); if (!it.dir) mt.title = new Date(it.mtime).toISOString();
+  d.append(nw, sz, mt);
+  return d;
+}
+function tile(it, i) {
+  const d = itemShell(it, i);
+  const th = el("div", "thumb"); th.appendChild(iconFor(it));
+  if (!it.dir && it.kind === "image" && it.size <= THUMB_MAX && it.size > 0) th.dataset.thumb = i;
+  d.append(th, nameNode(it), el("span", "sz", it.dir ? (it.virtual ? "" : "folder") : fmtBytes(it.size)));
+  return d;
+}
+function paintSel() {
+  const box = $("files");
+  for (const d of box.children) {
+    if (d.dataset.i == null) continue;
+    const i = +d.dataset.i, it = S.items[i], on = S.sel.has(it.id);
+    d.classList.toggle("sel", on); d.classList.toggle("cur", i === S.cursor);
+    d.setAttribute("aria-selected", on ? "true" : "false");
+    const cb = d.querySelector("input"); if (cb) cb.checked = on;
+  }
+  box.classList.toggle("anysel", S.sel.size > 0);
+  const sel = selItems(), files = sel.filter((x) => !x.dir);
+  $("ab-download").disabled = !files.length;
+  $("ab-rename").disabled = sel.length !== 1;
+  $("ab-move").disabled = !sel.length;
+  $("ab-copy").disabled = !sel.length;
+  $("ab-delete").disabled = !sel.length;
+  const nf = S.items.filter((x) => !x.dir), nd = S.items.length - nf.length;
+  const tot = nf.reduce((a, x) => a + x.size, 0);
+  $("sb-left").textContent = S.loading ? "loading…" : S.error ? "" :
+    (nd ? nd.toLocaleString() + " folder" + (nd === 1 ? "" : "s") + " · " : "") + nf.length.toLocaleString() + " file" + (nf.length === 1 ? "" : "s") + (nf.length ? " · " + fmtBytes(tot) : "") +
+    (S.filter ? " (filtered)" : "");
+  $("sb-right").textContent = sel.length ? sel.length.toLocaleString() + " selected" + (files.length ? " · " + fmtBytes(files.reduce((a, x) => a + x.size, 0)) : "") : "";
+  schedulePreview();
+}
+function itemEl(i) { return $("files").querySelector('[data-i="' + i + '"]'); }
+
+// ---------------- selection + keyboard ----------------
+function selectOnly(i) { S.sel.clear(); if (i >= 0 && S.items[i]) S.sel.add(S.items[i].id); S.anchor = i; S.cursor = i; }
+function selectRange(a, b, add) {
+  if (!add) S.sel.clear();
+  for (let k = Math.min(a, b); k <= Math.max(a, b); k++) S.sel.add(S.items[k].id);
+}
+const coarse = matchMedia("(pointer: coarse)");
+$("files").addEventListener("click", (e) => {
+  const d = e.target.closest(".it");
+  if (!d) { if (e.target === $("files")) { S.sel.clear(); S.anchor = -1; paintSel(); } return; }
+  const i = +d.dataset.i, it = S.items[i];
+  if (e.target.closest(".ck")) {
+    S.sel.has(it.id) ? S.sel.delete(it.id) : S.sel.add(it.id);
+    S.anchor = i; S.cursor = i; paintSel(); return;
+  }
+  if (coarse.matches && !e.shiftKey && !e.ctrlKey && !e.metaKey && !S.sel.size) { openItem(it); return; }
+  if (e.shiftKey && S.anchor >= 0) { selectRange(S.anchor, i, e.ctrlKey || e.metaKey); S.cursor = i; }
+  else if (e.ctrlKey || e.metaKey) { S.sel.has(it.id) ? S.sel.delete(it.id) : S.sel.add(it.id); S.anchor = i; S.cursor = i; }
+  else selectOnly(i);
+  paintSel();
+});
+$("files").addEventListener("dblclick", (e) => {
+  const d = e.target.closest(".it"); if (!d || e.target.closest(".ck")) return;
+  openItem(S.items[+d.dataset.i]);
+});
+function openItem(it) {
+  if (!it) return;
+  if (it.dir) nav(S.bucket, it.key);
+  else openViewer(S.items.indexOf(it));
+}
+function moveCursor(to, e) {
+  if (!S.items.length) return;
+  to = Math.max(0, Math.min(S.items.length - 1, to));
+  if (e.shiftKey) { if (S.anchor < 0) S.anchor = S.cursor < 0 ? to : S.cursor; selectRange(S.anchor, to, false); S.cursor = to; }
+  else selectOnly(to);
+  paintSel();
+  const d = itemEl(to); if (d) d.scrollIntoView({ block: "nearest" });
+}
+function gridCols() {
+  const box = $("files"); const kids = [...box.querySelectorAll(".it")];
+  if (S.view !== "grid" || kids.length < 2) return 1;
+  const top = kids[0].offsetTop; let n = 0;
+  for (const k of kids) { if (k.offsetTop !== top) break; n++; }
+  return Math.max(1, n);
+}
+let typeBuf = "", typeT = 0;
+function typingTarget(e) { const t = e.target; return t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable); }
+document.addEventListener("keydown", (e) => {
+  if (!creds || $("app").classList.contains("hidden")) return;
+  if ($("dlg").open) return;
+  if (viewer) return viewerKey(e);
+  if (menuEl && e.key === "Escape") { closeMenu(); return; }
+  const mod = e.ctrlKey || e.metaKey;
+  if (mod && e.key.toLowerCase() === "f") { e.preventDefault(); $("filter").focus(); $("filter").select(); return; }
+  if (typingTarget(e)) {
+    if (e.key === "Escape" && e.target === $("filter")) { $("filter").value = ""; S.filter = ""; applyView(); render(); $("files").focus(); }
+    if (e.key === "ArrowDown" && e.target === $("filter")) { e.preventDefault(); $("files").focus(); moveCursor(0, e); }
+    return;
+  }
+  const cur = S.cursor, cols = gridCols();
+  if (e.altKey && e.key === "ArrowLeft") { e.preventDefault(); if (navN > 0) history.back(); return; }
+  if (e.altKey && e.key === "ArrowRight") { e.preventDefault(); if (navN < navMax) history.forward(); return; }
+  if ((e.altKey && e.key === "ArrowUp") || e.key === "Backspace") { e.preventDefault(); if (S.prefix) nav(S.bucket, parentOf(S.prefix)); return; }
+  switch (e.key) {
+    case "ArrowDown": e.preventDefault(); moveCursor(cur < 0 ? 0 : cur + cols, e); return;
+    case "ArrowUp": e.preventDefault(); moveCursor(cur < 0 ? 0 : cur - cols, e); return;
+    case "ArrowRight": if (S.view === "grid") { e.preventDefault(); moveCursor(cur + 1, e); } return;
+    case "ArrowLeft": if (S.view === "grid") { e.preventDefault(); moveCursor(cur - 1, e); } return;
+    case "Home": e.preventDefault(); moveCursor(0, e); return;
+    case "End": e.preventDefault(); moveCursor(S.items.length - 1, e); return;
+    case "PageDown": e.preventDefault(); moveCursor(cur + 15 * cols, e); return;
+    case "PageUp": e.preventDefault(); moveCursor(cur - 15 * cols, e); return;
+    case "Enter": if (cur >= 0) { e.preventDefault(); openItem(S.items[cur]); } return;
+    case " ": if (cur >= 0 && !S.items[cur].dir) { e.preventDefault(); openViewer(cur); } return;
+    case "Delete": if (S.sel.size) { e.preventDefault(); doDelete(selItems()); } return;
+    case "F2": if (S.sel.size === 1) { e.preventDefault(); doRename(selItems()[0]); } return;
+    case "F5": e.preventDefault(); refresh(); return;
+    case "Escape": if (S.sel.size) { S.sel.clear(); paintSel(); } else if (S.clip) { S.clip = null; render(); } return;
+  }
+  if (mod) {
+    const k = e.key.toLowerCase();
+    if (k === "a") { e.preventDefault(); for (const it of S.items) S.sel.add(it.id); paintSel(); }
+    else if (k === "c" && S.sel.size) { e.preventDefault(); setClip("copy"); }
+    else if (k === "x" && S.sel.size) { e.preventDefault(); setClip("move"); }
+    else if (k === "v" && S.clip) { e.preventDefault(); paste(); }
+    return;
+  }
+  if (e.key.length === 1 && !e.altKey) { // type-ahead
+    clearTimeout(typeT); typeBuf += e.key.toLowerCase(); typeT = setTimeout(() => (typeBuf = ""), 700);
+    const start = typeBuf.length === 1 ? cur + 1 : Math.max(cur, 0);
+    for (let n = 0; n < S.items.length; n++) {
+      const i = (start + n) % S.items.length;
+      if (S.items[i].name.toLowerCase().startsWith(typeBuf)) { moveCursor(i, {}); break; }
+    }
+  }
+});
+
+// ---------------- context menu ----------------
+let menuEl = null;
+function closeMenu() { if (menuEl) { menuEl.remove(); menuEl = null; } }
+function openMenu(x, y, entries) {
+  closeMenu();
+  const m = el("div", "menu"); m.setAttribute("role", "menu");
+  for (const en of entries) {
+    if (en === "-") { m.appendChild(el("hr")); continue; }
+    const b = el("button", en.danger ? "dangerous" : ""); b.setAttribute("role", "menuitem");
+    b.append(icon(en.icon), el("span", "", en.label));
+    if (en.kbd) b.appendChild(el("kbd", "", en.kbd));
+    b.disabled = !!en.disabled;
+    b.onclick = () => { closeMenu(); en.run(); };
+    m.appendChild(b);
+  }
+  document.body.appendChild(m); menuEl = m;
+  const r = m.getBoundingClientRect();
+  m.style.left = Math.max(4, Math.min(x, innerWidth - r.width - 4)) + "px";
+  m.style.top = Math.max(4, Math.min(y, innerHeight - r.height - 4)) + "px";
+  const first = m.querySelector("button:not(:disabled)"); if (first) first.focus();
+  m.addEventListener("keydown", (e) => {
+    const bs = [...m.querySelectorAll("button:not(:disabled)")], i = bs.indexOf(document.activeElement);
+    if (e.key === "ArrowDown") { e.preventDefault(); bs[(i + 1) % bs.length].focus(); }
+    if (e.key === "ArrowUp") { e.preventDefault(); bs[(i - 1 + bs.length) % bs.length].focus(); }
+    if (e.key === "Escape") { e.preventDefault(); closeMenu(); $("files").focus(); }
+  });
+}
+document.addEventListener("mousedown", (e) => { if (menuEl && !menuEl.contains(e.target)) closeMenu(); });
+window.addEventListener("blur", closeMenu);
+$("files").addEventListener("scroll", closeMenu);
+$("files").addEventListener("contextmenu", (e) => {
+  e.preventDefault();
+  const d = e.target.closest(".it");
+  if (d) {
+    const i = +d.dataset.i;
+    if (!S.sel.has(S.items[i].id)) selectOnly(i);
+    S.cursor = i; paintSel();
+    openMenu(e.clientX, e.clientY, itemMenu(selItems()));
+  } else {
+    S.sel.clear(); paintSel();
+    openMenu(e.clientX, e.clientY, folderMenu());
+  }
+});
+function itemMenu(sel) {
+  const one = sel.length === 1 ? sel[0] : null, files = sel.filter((x) => !x.dir);
+  return [
+    one && one.dir ? { icon: "open", label: "Open", kbd: "Enter", run: () => openItem(one) } : null,
+    one && !one.dir ? { icon: "eye", label: "Preview", kbd: "Space", run: () => openItem(one) } : null,
+    { icon: "download", label: files.length > 1 ? "Download " + files.length + " files" : "Download", disabled: !files.length, run: () => downloadMany(files) },
+    "-",
+    { icon: "cut", label: "Cut", kbd: "Ctrl+X", run: () => setClip("move") },
+    { icon: "copy", label: "Copy", kbd: "Ctrl+C", run: () => setClip("copy") },
+    { icon: "paste", label: "Paste into folder", kbd: "Ctrl+V", disabled: !S.clip || !(one && one.dir), run: () => paste(one.key) },
+    "-",
+    { icon: "rename", label: "Rename", kbd: "F2", disabled: !one, run: () => doRename(one) },
+    { icon: "move", label: "Move to…", run: () => doTransferDialog(sel, "move") },
+    { icon: "copy", label: "Copy to…", run: () => doTransferDialog(sel, "copy") },
+    "-",
+    { icon: "link", label: "Copy S3 URI", disabled: !one, run: () => copyText("s3://" + S.bucket + "/" + one.key, "S3 URI") },
+    { icon: "trash", label: sel.length > 1 ? "Delete " + sel.length + " items" : "Delete", kbd: "Del", danger: true, run: () => doDelete(sel) },
+  ].filter((x) => x !== null).filter((x, i, a) => !(x === "-" && (i === 0 || a[i - 1] === "-")));
+}
+function folderMenu() {
+  return [
+    { icon: "upload", label: "Upload files", run: () => $("upfile").click() },
+    { icon: "upload", label: "Upload a folder", run: () => $("updir").click() },
+    { icon: "newfolder", label: "New folder", run: newFolder },
+    "-",
+    { icon: "paste", label: S.clip ? (S.clip.mode === "move" ? "Move " : "Paste ") + S.clip.items.length + " item" + (S.clip.items.length === 1 ? "" : "s") + " here" : "Paste", kbd: "Ctrl+V", disabled: !S.clip, run: () => paste() },
+    { icon: "check", label: "Select all", kbd: "Ctrl+A", disabled: !S.items.length, run: () => { for (const it of S.items) S.sel.add(it.id); paintSel(); } },
+    { icon: "refresh", label: "Refresh", kbd: "F5", run: refresh },
+    { icon: "link", label: "Copy S3 URI of this folder", run: () => copyText("s3://" + S.bucket + "/" + S.prefix, "S3 URI") },
+  ];
+}
+
+// ---------------- dialogs ----------------
+function dialog({ title, body, input, buttons, wide, node }) {
+  const dlg = $("dlg"); dlg.textContent = "";
+  const box = el("form", "dlg"); box.method = "dialog";
+  box.appendChild(el("h3", "", title));
+  const b = el("div", "body");
+  if (typeof body === "string") b.textContent = body; else if (body) b.appendChild(body);
+  box.appendChild(b);
+  let inp = null;
+  if (input) {
+    const f = el("div", "fld");
+    if (input.select) { f.appendChild(input.select); }
+    inp = el("input"); inp.type = "text"; inp.value = input.value || ""; inp.placeholder = input.placeholder || ""; inp.spellcheck = false; inp.autocomplete = "off";
+    f.appendChild(inp); box.appendChild(f);
+  }
+  let restore = null;
+  if (node) { const slot = node.parentNode; box.appendChild(node); restore = () => slot.appendChild(node); }
+  const btns = el("div", "btns");
+  return new Promise((resolve) => {
+    let result = null;
+    for (const bt of buttons) {
+      const x = el("button", bt.kind === "primary" ? "" : bt.kind === "danger" ? "danger" : "ghost", bt.label);
+      x.type = bt.kind === "primary" || bt.kind === "danger" ? "submit" : "button";
+      x.onclick = (e) => { e.preventDefault(); result = bt.value; dlg.close(); };
+      btns.appendChild(x);
+    }
+    box.appendChild(btns);
+    box.onsubmit = (e) => { e.preventDefault(); const p = buttons.find((x) => x.kind === "primary" || x.kind === "danger"); result = p ? p.value : null; dlg.close(); };
+    dlg.appendChild(box);
+    dlg.style.width = wide ? "min(760px, calc(100vw - 32px))" : "";
+    dlg.onclose = () => { if (restore) restore(); resolve({ button: result, value: inp ? inp.value : null }); $("files").focus({ preventScroll: true }); };
+    dlg.showModal();
+    if (inp) {
+      inp.focus();
+      if (input.selectRange) inp.setSelectionRange(input.selectRange[0], input.selectRange[1]); else inp.select();
+    } else { const p = btns.querySelector("button[type=submit]") || btns.lastChild; p.focus(); }
+  });
+}
+function listBody(text, names, more) {
+  const d = el("div"); d.appendChild(el("div", "", text));
+  if (names && names.length) {
+    const ul = el("ul"); for (const n of names.slice(0, 12)) ul.appendChild(el("li", "", n));
+    if (names.length > 12) ul.appendChild(el("li", "", "… and " + (names.length - 12) + " more"));
+    d.appendChild(ul);
+  }
+  if (more) d.appendChild(el("div", "note", more));
+  return d;
+}
+function badName(n) {
+  if (!n || !n.trim()) return "A name is needed.";
+  if (n.includes("/")) return "Names cannot contain “/”.";
+  if (n === "." || n === "..") return "That name is reserved.";
+  return "";
+}
+
+// ---------------- jobs (transfers) ----------------
+const jobs = [];
+let jobSeq = 0;
+function addJob(title, sub, kind) {
+  const j = { id: ++jobSeq, title, sub: sub || "queued", state: "queued", frac: null, kind: kind || "op" };
+  const d = el("div", "job"); j.el = d;
+  j.tEl = el("div", "jt", title); j.tEl.title = title;
+  j.sEl = el("div", "js");
+  j.pEl = el("div", "prog ind"); j.pEl.appendChild(el("i"));
+  const x = el("button", "ib jx"); x.title = "Cancel"; x.setAttribute("aria-label", "cancel"); x.appendChild(icon("x"));
+  x.onclick = () => cancelJob(j); j.xEl = x;
+  d.append(j.tEl, x, j.sEl, j.pEl);
+  $("jobs-list").prepend(d); jobs.push(j);
+  show($("jobs"), true); $("jobs").classList.remove("min");
+  paintJob(j); return j;
+}
+function setJob(j, patch) { Object.assign(j, patch); paintJob(j); }
+function paintJob(j) {
+  j.el.className = "job " + j.state;
+  j.sEl.textContent = j.sub || "";
+  j.sEl.title = j.sub || "";
+  const ind = j.frac == null || j.state === "wait" || j.state === "queued";
+  j.pEl.classList.toggle("ind", ind);
+  j.pEl.firstChild.style.width = ind ? "" : Math.round(j.frac * 100) + "%";
+  show(j.xEl, ["queued", "run", "wait"].includes(j.state) && !!j.cancellable);
+  const act = jobs.filter((x) => ["queued", "run", "wait"].includes(x.state)).length;
+  const bad = jobs.filter((x) => x.state === "err").length;
+  $("jobs-title").textContent = (act ? act + " in progress" : "Transfers done") + (bad ? " · " + bad + " failed" : "");
+}
+function cancelJob(j) {
+  j.cancelled = true;
+  if (j.abort) j.abort();
+  if (j.state === "queued") setJob(j, { state: "cancelled", sub: "cancelled" });
+}
+$("jobs-clear").onclick = () => {
+  for (const j of jobs.slice()) if (["done", "err", "cancelled"].includes(j.state)) { j.el.remove(); jobs.splice(jobs.indexOf(j), 1); }
+  if (!jobs.length) show($("jobs"), false); else paintJob(jobs[0]);
+};
+$("jobs-min").onclick = () => $("jobs").classList.toggle("min");
+window.addEventListener("beforeunload", (e) => {
+  if (jobs.some((j) => ["queued", "run", "wait"].includes(j.state))) { e.preventDefault(); e.returnValue = ""; }
+});
+async function pool(items, n, fn) {
+  let i = 0;
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => { while (i < items.length) { const k = i++; await fn(items[k], k); } }));
+}
+function afterChange(bucket) { invalidate(bucket); if (bucket === S.bucket) refresh(); status(); }
+
+// ---------------- uploads ----------------
+const upQ = [];
+let upRunning = false;
+async function enqueueUploads(list, bucket, prefix) {
+  if (!list.length) return;
+  const known = cache.get(cid(bucket, prefix));
+  const clash = known ? list.filter((u) => known.files.some((f) => f.key === prefix + u.path)) : [];
+  if (clash.length) {
+    const r = await dialog({
+      title: "Replace existing files?",
+      body: listBody(clash.length + " of the " + list.length + " file" + (list.length === 1 ? "" : "s") + " already exist in " + bucket + "/" + prefix + ":", clash.map((u) => u.path)),
+      buttons: [{ label: "cancel", value: null }, { label: "skip those", value: "skip" }, { label: "replace", value: "replace", kind: "primary" }],
+    });
+    if (!r.button) return;
+    if (r.button === "skip") list = list.filter((u) => !clash.includes(u));
+  }
+  for (const u of list) {
+    const j = addJob(u.path, "queued · " + fmtBytes(u.file.size), "up");
+    j.cancellable = true;
+    upQ.push({ job: j, bucket, key: prefix + u.path, file: u.file });
+  }
+  pumpUploads();
+}
+async function pumpUploads() {
+  if (upRunning) return;
+  upRunning = true;
+  while (upQ.length) {
+    const u = upQ.shift();
+    if (u.job.cancelled) continue;
+    await uploadOne(u);
+    afterChange(u.bucket);
+  }
+  upRunning = false;
+}
+async function waitUntil(job, check, what) {
+  const until = Date.now() + PENDING_WAIT_MS;
+  while (Date.now() < until) {
+    if (job.cancelled) throw new Error("stopped waiting (the upload may still finish on Sia)");
+    try { if (await check()) return true; } catch (e) {}
+    await sleep(POLL_MS);
+  }
+  throw new Error(what + " did not appear within " + PENDING_WAIT_MS / 60e3 + " minutes");
+}
+async function uploadOne(u) {
+  const { job, bucket, key, file } = u;
+  const ct = file.type || MIME[extOf(key)] || "";
+  const sending = (f) => setJob(job, { state: "run", frac: f, sub: f < 1 ? "sending " + Math.round(f * 100) + "% of " + fmtBytes(file.size) : "storing on Sia (erasure-coding across 30 hosts)…" });
+  try {
+    if (file.size <= SINGLE_MAX) {
+      sending(0);
+      const r = await s3xhr("PUT", bucket, key, {}, file, ct ? { "content-type": ct } : null, sending, job);
+      if (r.aborted) { setJob(job, { state: "cancelled", sub: "cancelled" }); return; }
+      if (!r.ok) {
+        if (!gaveUp(r)) throw new Error(errText(r.status, r.text));
+        setJob(job, { state: "wait", sub: "sent; the gateway stopped waiting while Sia stores it, checking…" });
+        const want = md5hex(new Uint8Array(await file.arrayBuffer()));
+        await waitUntil(job, async () => {
+          const h = await s3("HEAD", bucket, key, {});
+          return h.ok && (h.headers.get("etag") || "").replace(/"/g, "") === want;
+        }, "the file");
+      }
+    } else {
+      await multipart(u, ct);
+      if (job.state === "cancelled") return;
+    }
+    setJob(job, { state: "done", frac: 1, sub: "uploaded · " + fmtBytes(file.size) });
+  } catch (e) {
+    setJob(job, { state: "err", sub: e.message });
+  }
+}
+async function multipart(u, ct) {
+  const { job, bucket, key, file } = u;
+  setJob(job, { state: "run", frac: 0, sub: "starting a multipart upload…" });
+  const r0 = await s3("POST", bucket, key, { uploads: "" }, { headers: ct ? { "content-type": ct } : null });
+  if (!r0.ok) throw new Error(await s3err(r0));
+  const uid = tagText(xmlDoc(await r0.text()), "UploadId");
+  if (!uid) throw new Error("no UploadId in the reply");
+  const abort = () => s3("DELETE", bucket, key, { uploadId: uid }).catch(() => {});
+  try {
+    const n = Math.ceil(file.size / PART), parts = [];
+    for (let i = 0; i < n; i++) {
+      if (job.cancelled) { await abort(); setJob(job, { state: "cancelled", sub: "cancelled" }); return; }
+      const blob = file.slice(i * PART, Math.min(file.size, (i + 1) * PART));
+      const prog = (f) => setJob(job, { state: "run", frac: (i + f) / n, sub: "part " + (i + 1) + "/" + n + (f < 1 ? " sending " + Math.round(f * 100) + "%" : " storing on Sia…") });
+      prog(0);
+      const r = await s3xhr("PUT", bucket, key, { partNumber: String(i + 1), uploadId: uid }, blob, null, prog, job);
+      if (r.aborted) { await abort(); setJob(job, { state: "cancelled", sub: "cancelled" }); return; }
+      if (r.ok) parts.push({ n: i + 1, etag: (r.etag || "").replace(/"/g, "") });
+      else if (gaveUp(r)) parts.push({ n: i + 1, etag: md5hex(new Uint8Array(await blob.arrayBuffer())), late: true });
+      else throw new Error("part " + (i + 1) + ": " + errText(r.status, r.text));
+    }
+    const late = parts.some((p) => p.late);
+    const body = "<CompleteMultipartUpload>" + parts.map((p) => "<Part><PartNumber>" + p.n + "</PartNumber><ETag>\"" + p.etag + "\"</ETag></Part>").join("") + "</CompleteMultipartUpload>";
+    setJob(job, { state: "wait", sub: late ? "waiting for Sia to finish storing the last parts…" : "assembling the parts…" });
+    const until = Date.now() + PENDING_WAIT_MS;
+    for (;;) {
+      if (job.cancelled) { await abort(); setJob(job, { state: "cancelled", sub: "cancelled" }); return; }
+      const r = await s3("POST", bucket, key, { uploadId: uid }, { body, headers: { "content-type": "application/xml" } });
+      const t = await r.text();
+      if (r.ok && !/<Error>/.test(t)) return;
+      if (gaveUp(r)) {
+        await waitUntil(job, async () => { const h = await s3("HEAD", bucket, key, {}); return h.ok && +h.headers.get("content-length") === file.size; }, "the file");
+        return;
+      }
+      if (late && r.status === 400 && /InvalidPart/.test(t) && Date.now() < until) { await sleep(POLL_MS); continue; }
+      throw new Error(errText(r.status, t));
+    }
+  } catch (e) { await abort(); throw e; }
+}
+$("upfile").onchange = (e) => {
+  const fs = Array.from(e.target.files || []); e.target.value = "";
+  enqueueUploads(fs.map((f) => ({ file: f, path: f.name })), S.bucket, S.prefix);
+};
+$("updir").onchange = (e) => {
+  const fs = Array.from(e.target.files || []); e.target.value = "";
+  enqueueUploads(fs.map((f) => ({ file: f, path: f.webkitRelativePath || f.name })), S.bucket, S.prefix);
+};
+async function filesFromDrop(dt) {
+  const entries = Array.from(dt.items || [], (i) => (i.kind === "file" && i.webkitGetAsEntry ? i.webkitGetAsEntry() : null)).filter(Boolean);
+  if (!entries.length) return Array.from(dt.files || [], (f) => ({ file: f, path: f.name }));
+  const out = [];
+  const walk = async (en, base) => {
+    if (en.isFile) out.push({ file: await new Promise((res, rej) => en.file(res, rej)), path: base + en.name });
+    else if (en.isDirectory) {
+      const rd = en.createReader(); let batch;
+      do { batch = await new Promise((res, rej) => rd.readEntries(res, rej)); for (const c of batch) await walk(c, base + en.name + "/"); } while (batch.length);
+    }
+  };
+  for (const en of entries) await walk(en, "");
+  return out;
+}
+
+// ---------------- drag and drop ----------------
+const isInternal = (e) => S.drag && e.dataTransfer.types.includes("application/x-sia-s3");
+const isFiles = (e) => !S.drag && e.dataTransfer.types.includes("Files");
+function dropTarget(node, where) {
+  node.addEventListener("dragover", (e) => {
+    if (!isInternal(e) && !isFiles(e)) return;
+    const w = where();
+    if (isInternal(e) && S.drag.items.some((it) => it.dir && w.b === S.drag.b && w.p.startsWith(it.key))) return;
+    e.preventDefault(); e.stopPropagation();
+    e.dataTransfer.dropEffect = isFiles(e) || e.ctrlKey || e.altKey || w.b !== S.drag.b ? "copy" : "move";
+    node.classList.add("drop");
+    if (isFiles(e)) dropOverlay(true, w);
+  });
+  node.addEventListener("dragleave", () => node.classList.remove("drop"));
+  node.addEventListener("drop", (e) => {
+    node.classList.remove("drop");
+    const w = where();
+    if (isInternal(e)) {
+      e.preventDefault(); e.stopPropagation();
+      const d = S.drag; S.drag = null;
+      runTransfer(d.b, d.items.map((it) => ({ it, name: it.name })), w.b, w.p, e.ctrlKey || e.altKey || w.b !== d.b ? "copy" : "move");
+    } else if (isFiles(e)) {
+      e.preventDefault(); e.stopPropagation(); dropOverlay(false);
+      filesFromDrop(e.dataTransfer).then((l) => enqueueUploads(l, w.b, w.p));
+    }
+  });
+}
+function dropOverlay(on, w) {
+  const o = $("dropov");
+  if (on) {
+    o.textContent = ""; o.appendChild(icon("upload"));
+    o.appendChild(el("div", "", "Drop to upload into"));
+    o.appendChild(el("b", "", (w ? w.b + "/" + w.p : S.bucket + "/" + S.prefix)));
+  }
+  show(o, on);
+}
+$("files").addEventListener("dragstart", (e) => {
+  const d = e.target.closest && e.target.closest(".it"); if (!d) return;
+  const i = +d.dataset.i;
+  if (!S.sel.has(S.items[i].id)) { selectOnly(i); paintSel(); }
+  S.drag = { b: S.bucket, items: selItems() };
+  e.dataTransfer.setData("application/x-sia-s3", "1");
+  e.dataTransfer.setData("text/plain", S.drag.items.map((it) => "s3://" + S.bucket + "/" + it.key).join("\n"));
+  e.dataTransfer.effectAllowed = "copyMove";
+});
+document.addEventListener("dragend", () => { S.drag = null; dropOverlay(false); document.querySelectorAll(".drop").forEach((n) => n.classList.remove("drop")); });
+// rows that are folders accept drops; the list background means "this folder"
+$("files").addEventListener("dragover", (e) => {
+  const d = e.target.closest(".it");
+  document.querySelectorAll("#files .it.drop").forEach((n) => n !== d && n.classList.remove("drop"));
+  const it = d ? S.items[+d.dataset.i] : null;
+  const target = it && it.dir && !(S.drag && S.drag.items.includes(it)) ? { b: S.bucket, p: it.key } : null;
+  if (isFiles(e)) {
+    e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = "copy";
+    if (d) d.classList.toggle("drop", !!target);
+    dropOverlay(true, target || { b: S.bucket, p: S.prefix });
+  } else if (isInternal(e) && target) {
+    if (S.drag.items.some((x) => x.dir && target.p.startsWith(x.key))) return;
+    e.preventDefault(); e.dataTransfer.dropEffect = e.ctrlKey || e.altKey ? "copy" : "move";
+    d.classList.add("drop");
+  }
+});
+$("files").addEventListener("dragleave", (e) => {
+  if (!$("files").contains(e.relatedTarget)) { dropOverlay(false); document.querySelectorAll("#files .it.drop").forEach((n) => n.classList.remove("drop")); }
+});
+$("files").addEventListener("drop", (e) => {
+  const d = e.target.closest(".it"), it = d ? S.items[+d.dataset.i] : null;
+  document.querySelectorAll("#files .it.drop").forEach((n) => n.classList.remove("drop"));
+  if (isFiles(e)) {
+    e.preventDefault(); e.stopPropagation(); dropOverlay(false);
+    const p = it && it.dir ? it.key : S.prefix;
+    filesFromDrop(e.dataTransfer).then((l) => enqueueUploads(l, S.bucket, p));
+  } else if (isInternal(e) && it && it.dir) {
+    e.preventDefault();
+    const dr = S.drag; S.drag = null;
+    runTransfer(dr.b, dr.items.map((x) => ({ it: x, name: x.name })), S.bucket, it.key, e.ctrlKey || e.altKey ? "copy" : "move");
+  }
+});
+
+// ---------------- downloads ----------------
+const dlQ = [];
+let dlRunning = false;
+function save(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a"); a.href = url; a.download = name || "object";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+function downloadMany(files) {
+  const b = S.bucket;
+  for (const f of files) { const j = addJob("↓ " + f.name, "queued", "down"); j.cancellable = true; dlQ.push({ job: j, b, it: f }); }
+  pumpDownloads();
+}
+async function pumpDownloads() {
+  if (dlRunning) return;
+  dlRunning = true;
+  while (dlQ.length) {
+    const { job, b, it } = dlQ.shift();
+    if (job.cancelled) continue;
+    const ac = new AbortController(); job.abort = () => ac.abort();
+    try {
+      setJob(job, { state: "run", frac: 0, sub: "fetching from Sia…" });
+      const blob = await fetchBlob(b, it.key, it.size, ac.signal, (f, got) => setJob(job, { frac: f, sub: fmtBytes(got) + " of " + fmtBytes(it.size) }));
+      // octet-stream: a download never renders in this origin, whatever the object claims to be
+      save(new Blob([blob], { type: "application/octet-stream" }), baseName(it.key));
+      setJob(job, { state: "done", frac: 1, sub: "downloaded · " + fmtBytes(it.size) });
+    } catch (e) {
+      setJob(job, ac.signal.aborted ? { state: "cancelled", sub: "cancelled" } : { state: "err", sub: e.message });
+    }
+  }
+  dlRunning = false;
+}
+async function fetchBlob(b, key, size, signal, onProg, range) {
+  const r = await s3("GET", b, key, {}, { signal, headers: range ? { range } : null });
+  if (!r.ok) throw new Error(await s3err(r));
+  const total = +r.headers.get("content-length") || size || 0;
+  if (!r.body || !onProg) return await r.blob();
+  const rd = r.body.getReader(), chunks = []; let got = 0;
+  for (;;) {
+    const { done, value } = await rd.read();
+    if (done) break;
+    chunks.push(value); got += value.length;
+    onProg(total ? got / total : 0, got);
+  }
+  if (total && got !== total) throw new Error("short read: " + got + " of " + total + " bytes");
+  return new Blob(chunks);
+}
+
+// ---------------- rename / move / copy / delete ----------------
+async function doRename(it) {
+  if (!it) return;
+  const dot = it.dir ? -1 : it.name.lastIndexOf(".");
+  const r = await dialog({
+    title: "Rename " + (it.dir ? "folder" : "file"),
+    body: it.dir ? "Every object in the folder is re-keyed. On Sia this rewrites metadata only; no data moves." : "",
+    input: { value: it.name, selectRange: [0, dot > 0 ? dot : it.name.length] },
+    buttons: [{ label: "cancel", value: null }, { label: "rename", value: "ok", kind: "primary" }],
+  });
+  if (r.button !== "ok") return;
+  const name = r.value.trim();
+  const bad = badName(name); if (bad) { toast(bad, true); return; }
+  if (name === it.name) return;
+  runTransfer(S.bucket, [{ it, name }], S.bucket, S.prefix, "move");
+}
+async function doTransferDialog(sel, mode) {
+  if (!sel.length) return;
+  const bs = el("select"); for (const b of S.buckets) { const o = el("option", "", b); o.value = b; bs.appendChild(o); }
+  bs.value = S.bucket; bs.style.flex = "0 0 auto";
+  const r = await dialog({
+    title: (mode === "move" ? "Move " : "Copy ") + (sel.length === 1 ? "“" + sel[0].name + "”" : sel.length + " items") + " to…",
+    body: listBody("Destination folder (bucket, then a path; missing folders are created):", null,
+      mode === "copy" ? "Copies share the original's data on Sia: only metadata is written." : "Moving rewrites metadata only; no data moves."),
+    input: { value: S.prefix, placeholder: "path/to/folder/", select: bs },
+    buttons: [{ label: "cancel", value: null }, { label: mode, value: "ok", kind: "primary" }],
+  });
+  if (r.button !== "ok") return;
+  let p = r.value.trim().replace(/^\/+/, "");
+  if (p && !p.endsWith("/")) p += "/";
+  if (p.split("/").slice(0, -1).some((s) => !s)) { toast("Empty folder names (“//”) are not allowed.", true); return; }
+  runTransfer(S.bucket, sel.map((it) => ({ it, name: it.name })), bs.value, p, mode);
+}
+function setClip(mode) {
+  const sel = selItems(); if (!sel.length) return;
+  S.clip = { mode, b: S.bucket, items: sel };
+  toast((mode === "move" ? "Cut " : "Copied ") + sel.length + " item" + (sel.length === 1 ? "" : "s") + ": paste in another folder");
+  render();
+}
+function paste(into) {
+  const c = S.clip; if (!c) return;
+  const p = into != null ? into : S.prefix;
+  if (c.mode === "move") S.clip = null;
+  runTransfer(c.b, c.items.map((it) => ({ it, name: it.name })), S.bucket, p, c.mode);
+}
+// plan: [{it, name}] from srcB's current folder → dstB/dstP. Copy is CopyObject (metadata only on Sia); move adds DELETE.
+async function runTransfer(srcB, plan, dstB, dstP, mode) {
+  plan = plan.filter(({ it, name }) => !(srcB === dstB && dstP + name + (it.dir ? "/" : "") === it.key));
+  if (!plan.length) return;
+  for (const { it } of plan) if (it.dir && dstB === srcB && dstP.startsWith(it.key)) { toast("A folder cannot go inside itself.", true); return; }
+  let dest;
+  try { dest = await listFolder(dstB, dstP, true); } catch (e) { dest = { dirs: [], files: [] }; }
+  const clash = plan.filter(({ it, name }) => (it.dir ? dest.dirs.includes(dstP + name + "/") : dest.files.some((f) => f.key === dstP + name)));
+  if (clash.length) {
+    const r = await dialog({
+      title: "Replace existing items?",
+      body: listBody("These already exist in " + dstB + "/" + dstP + " (folders are merged, files with the same name replaced):", clash.map((c) => c.name + (c.it.dir ? "/" : ""))),
+      buttons: [{ label: "cancel", value: null }, { label: "skip those", value: "skip" }, { label: "replace", value: "replace", kind: "primary" }],
+    });
+    if (!r.button) return;
+    if (r.button === "skip") plan = plan.filter((p) => !clash.includes(p));
+    if (!plan.length) return;
+  }
+  const verb = mode === "move" ? "Moving" : "Copying";
+  const job = addJob(verb + " " + (plan.length === 1 ? plan[0].it.name : plan.length + " items") + " → " + dstB + "/" + dstP, "listing…");
+  job.cancellable = true;
+  try {
+    const pairs = [];
+    for (const { it, name } of plan) {
+      if (it.virtual) { // nothing stored yet: just carry the empty folder along
+        virt.add(cid(dstB, dstP + name + "/")); if (mode === "move") virt.delete(cid(srcB, it.key)); continue;
+      }
+      if (it.dir) {
+        const keys = await listAll(srcB, it.key, (n) => setJob(job, { state: "run", sub: "listing " + it.name + "/ … " + n }));
+        for (const k of keys) pairs.push([k.key, dstP + name + "/" + k.key.slice(it.key.length)]);
+        if (mode === "move") for (const v of [...virt]) { const [vb, vp] = v.split("\n"); if (vb === srcB && vp.startsWith(it.key)) { virt.delete(v); virt.add(cid(dstB, dstP + name + "/" + vp.slice(it.key.length))); } }
+      } else pairs.push([it.key, dstP + name]);
+    }
+    let done = 0; const errs = [];
+    setJob(job, { state: "run", frac: 0, sub: "0 of " + pairs.length });
+    await pool(pairs, 4, async ([src, dst]) => {
+      if (job.cancelled) return;
+      try {
+        const r = await s3("PUT", dstB, dst, {}, { headers: { "x-amz-copy-source": "/" + awsEnc(srcB, false) + "/" + awsEnc(src, true) } });
+        const t = await r.text();
+        if (!r.ok || /<Error>/.test(t)) throw new Error(errText(r.status, t));
+        if (mode === "move" && !(srcB === dstB && src === dst)) {
+          const d = await s3("DELETE", srcB, src, {});
+          if (!d.ok && d.status !== 204) throw new Error("copied, but the original stays: " + (await s3err(d)));
+        }
+      } catch (e) { errs.push(src + ": " + e.message); }
+      done++;
+      setJob(job, { frac: done / pairs.length, sub: done + " of " + pairs.length + (errs.length ? " · " + errs.length + " failed" : "") });
+    });
+    if (job.cancelled) setJob(job, { state: "cancelled", sub: "stopped after " + done + " of " + pairs.length });
+    else if (errs.length) setJob(job, { state: "err", sub: errs.length + " of " + pairs.length + " failed: " + errs[0] });
+    else setJob(job, { state: "done", frac: 1, sub: (mode === "move" ? "moved " : "copied ") + pairs.length + " object" + (pairs.length === 1 ? "" : "s") });
+  } catch (e) { setJob(job, { state: "err", sub: e.message }); }
+  invalidate(srcB); if (dstB !== srcB) invalidate(dstB);
+  refresh(); renderTree(); status();
+}
+async function doDelete(sel) {
+  if (!sel.length) return;
+  const real = sel.filter((it) => !it.virtual), dirs = real.filter((it) => it.dir);
+  let keys = real.filter((it) => !it.dir).map((it) => ({ key: it.key, size: it.size }));
+  if (dirs.length) {
+    toast("Counting what is in " + (dirs.length === 1 ? dirs[0].name + "/" : dirs.length + " folders") + "…");
+    try { for (const d of dirs) keys = keys.concat(await listAll(S.bucket, d.key)); } catch (e) { toast(e.message, true); return; }
+  }
+  const bytes = keys.reduce((a, k) => a + (k.size || 0), 0);
+  const r = await dialog({
+    title: "Delete " + (sel.length === 1 ? "“" + sel[0].name + (sel[0].dir ? "/" : "") + "”" : sel.length + " items") + "?",
+    body: listBody(
+      keys.length ? keys.length.toLocaleString() + " object" + (keys.length === 1 ? "" : "s") + " (" + fmtBytes(bytes) + ") will be removed from Sia. This cannot be undone." : "Only empty folders: nothing is stored.",
+      sel.length > 1 ? sel.map((it) => it.name + (it.dir ? "/" : "")) : null),
+    buttons: [{ label: "cancel", value: null }, { label: "delete", value: "ok", kind: "danger" }],
+  });
+  if (r.button !== "ok") return;
+  for (const it of sel) if (it.dir) for (const v of [...virt]) { const [vb, vp] = v.split("\n"); if (vb === S.bucket && vp.startsWith(it.key)) virt.delete(v); }
+  const b = S.bucket;
+  if (!keys.length) { build(); render(); renderTree(); return; }
+  const job = addJob("Deleting " + (sel.length === 1 ? sel[0].name : sel.length + " items"), "0 of " + keys.length);
+  job.cancellable = true;
+  let done = 0; const errs = [];
+  for (let i = 0; i < keys.length; i += 100) {
+    if (job.cancelled) break;
+    const batch = keys.slice(i, i + 100);
+    const body = "<Delete><Quiet>true</Quiet>" + batch.map((k) => "<Object><Key>" + xmlEsc(k.key) + "</Key></Object>").join("") + "</Delete>";
+    try {
+      const r2 = await s3("POST", b, "", { delete: "" }, { body, headers: { "content-type": "application/xml" } });
+      const t = await r2.text();
+      if (!r2.ok) throw new Error(errText(r2.status, t));
+      const d = xmlDoc(t);
+      for (const e of d.getElementsByTagName("Error")) errs.push(tagText(e, "Key") + ": " + tagText(e, "Message"));
+    } catch (e) { errs.push(e.message); }
+    done += batch.length;
+    setJob(job, { state: "run", frac: done / keys.length, sub: done + " of " + keys.length + (errs.length ? " · " + errs.length + " failed" : "") });
+  }
+  if (job.cancelled) setJob(job, { state: "cancelled", sub: "stopped after " + done + " of " + keys.length });
+  else if (errs.length) setJob(job, { state: "err", sub: errs.length + " failed: " + errs[0] });
+  else setJob(job, { state: "done", frac: 1, sub: "deleted " + keys.length + " object" + (keys.length === 1 ? "" : "s") + " · " + fmtBytes(bytes) });
+  afterChange(b); renderTree();
+}
+async function newFolder() {
+  const r = await dialog({
+    title: "New folder in " + S.bucket + "/" + S.prefix,
+    body: "S3 has no empty folders: this one exists in this tab until a file is uploaded or moved into it. (An empty marker object would cost a full Sia slab.)",
+    input: { value: "", placeholder: "folder name" },
+    buttons: [{ label: "cancel", value: null }, { label: "create", value: "ok", kind: "primary" }],
+  });
+  if (r.button !== "ok") return;
+  const name = r.value.trim(), bad = badName(name);
+  if (bad) { toast(bad, true); return; }
+  const p = S.prefix + name + "/";
+  if (S.all.some((it) => it.dir && it.key === p)) { toast("That folder already exists.", true); return; }
+  virt.add(cid(S.bucket, p));
+  S.expanded.add(cid(S.bucket, S.prefix));
+  build(); render(); renderTree();
+  const i = S.items.findIndex((it) => it.key === p);
+  if (i >= 0) { selectOnly(i); paintSel(); const d = itemEl(i); if (d) d.scrollIntoView({ block: "nearest" }); }
+}
+
+// ---------------- preview ----------------
+// Blob URLs of fetched objects, kept for a little while so re-opening a file is instant.
+const blobs = new Map(); let blobBytes = 0;
+const BLOB_BUDGET = 256 << 20;
+async function blobUrl(b, it, mime, signal, onProg) {
+  const id = b + "\n" + it.key + "\n" + it.etag;
+  const hit = blobs.get(id);
+  if (hit) { blobs.delete(id); blobs.set(id, hit); return hit.url; }
+  const raw = await fetchBlob(b, it.key, it.size, signal, onProg);
+  // the type is OURS (decided from the extension or the sniffed bytes), never the server's claim, and never HTML
+  const url = URL.createObjectURL(new Blob([raw], { type: mime || "application/octet-stream" }));
+  blobs.set(id, { url, size: it.size }); blobBytes += it.size;
+  for (const [k, v] of blobs) {
+    if (blobBytes <= BLOB_BUDGET || blobs.size <= 2) break;
+    URL.revokeObjectURL(v.url); blobBytes -= v.size; blobs.delete(k);
+  }
+  return url;
+}
+let pvT = 0, pvGen = 0, pvAbort = null, pvFirst = 0;
+// debounced while the selection is moving, but never put off for more than half a second
+function schedulePreview() {
+  clearTimeout(pvT);
+  if (!pvFirst) pvFirst = Date.now();
+  pvT = setTimeout(renderPreview, Date.now() - pvFirst > 500 ? 0 : 140);
+}
+function renderPreview() {
+  pvFirst = 0;
+  if (!S.pv || getComputedStyle($("pv")).display === "none") return;
+  const pv = $("pv");
+  const sel = selItems();
+  const key = sel.map((x) => x.id).join("\n") + "|" + S.bucket + "|" + S.prefix + "|" + (S.data ? S.data.at : 0);
+  if (pv.dataset.k === key) return;
+  pv.dataset.k = key;
+  if (pvAbort) pvAbort.abort();
+  pvAbort = new AbortController();
+  const gen = ++pvGen;
+  pv.textContent = "";
+  if (sel.length === 1 && !sel[0].dir) { fillPreview(pv, S.bucket, sel[0], pvAbort.signal, () => gen === pvGen, false); return; }
+  const head = el("div", "pvh");
+  if (sel.length === 1) {
+    const it = sel[0];
+    head.append(icon("folder", "k-folder"), (() => { const d = el("div"); d.append(el("div", "t", it.name + "/"), el("div", "s", it.virtual ? "empty folder (this tab only)" : "folder")); return d; })());
+    pv.appendChild(head);
+    const a = el("div", "pvact");
+    a.append(actBtn("open", "Open", () => openItem(it)), actBtn("rename", "Rename", () => doRename(it)), actBtn("trash", "Delete", () => doDelete([it]), true));
+    pv.appendChild(a);
+    if (it.virtual) pv.appendChild(el("div", "pvnote", "Upload or move a file into it to keep it: S3 stores keys, not folders."));
+    return;
+  }
+  const files = (sel.length ? sel : S.items).filter((x) => !x.dir), dirs = (sel.length ? sel : S.items).length - files.length;
+  const t = sel.length ? sel.length + " items selected" : (S.prefix ? baseName(S.prefix) + "/" : S.bucket);
+  head.append(icon(sel.length ? "check" : S.prefix ? "folder" : "bucket", "k-folder"), (() => {
+    const d = el("div"); d.append(el("div", "t", t), el("div", "s", (dirs ? dirs + " folder" + (dirs === 1 ? "" : "s") + ", " : "") + files.length + " file" + (files.length === 1 ? "" : "s") + " · " + fmtBytes(files.reduce((a, x) => a + x.size, 0)))); return d;
+  })());
+  pv.appendChild(head);
+  if (sel.length) {
+    const a = el("div", "pvact");
+    if (files.length) a.appendChild(actBtn("download", "Download", () => downloadMany(files)));
+    a.append(actBtn("move", "Move", () => doTransferDialog(sel, "move")), actBtn("copy", "Copy", () => doTransferDialog(sel, "copy")), actBtn("trash", "Delete", () => doDelete(sel), true));
+    pv.appendChild(a);
+  } else {
+    const dl = el("dl", "meta");
+    const kv = (k, v) => { dl.append(el("dt", "", k), el("dd", "", v)); };
+    kv("location", "s3://" + S.bucket + "/" + S.prefix);
+    const kinds = {}; for (const f of files) { const k = f.kind || "other"; kinds[k] = (kinds[k] || 0) + 1; }
+    const ks = Object.entries(kinds).sort((a, b) => b[1] - a[1]).map(([k, n]) => n + " " + k).join(", ");
+    if (ks) kv("types", ks);
+    const newest = files.reduce((a, f) => Math.max(a, f.mtime), 0); if (newest) kv("newest", fmtDate(newest));
+    pv.appendChild(dl);
+    pv.appendChild(el("div", "pvnote", "Select a file to preview it. Drag files in to upload; drag items onto a folder to move them (hold Ctrl to copy). Right-click for more."));
+  }
+}
+function actBtn(ic, label, fn, danger) { const b = el("button", "ib" + (danger ? " dangerous" : "")); b.append(icon(ic), el("span", "", label)); b.onclick = fn; return b; }
+// Fill `box` with a preview of one object: header, media, metadata, actions.
+async function fillPreview(box, b, it, signal, alive, big) {
+  const head = el("div", "pvh");
+  const ttl = el("div"); ttl.append(el("div", "t", it.name), el("div", "s", fmtBytes(it.size) + " · " + fmtDate(it.mtime)));
+  const ic = el("span"); ic.appendChild(iconFor(it));
+  head.append(ic, ttl);
+  if (!big) box.appendChild(head);
+  const media = el("div", "media"); box.appendChild(media);
+  const msg = (text, btn) => { media.textContent = ""; const m = el("div", "msg", text); if (btn) { m.appendChild(el("br")); m.appendChild(btn); } media.appendChild(m); };
+  const bigIcon = () => { media.textContent = ""; const d = el("div", "big"); d.appendChild(iconFor(it)); media.appendChild(d); };
+  bigIcon();
+  const dl = el("dl", "meta");
+  const kv = (k, v) => { dl.append(el("dt", "", k), el("dd", "", v)); };
+  kv("key", it.key); kv("size", fmtBytes(it.size) + " (" + it.size.toLocaleString() + " bytes)"); kv("modified", it.mtime ? new Date(it.mtime).toISOString().replace(".000Z", "Z") : "–");
+  kv("etag", it.etag || "–");
+  if (!big) {
+    box.appendChild(dl);
+    const a = el("div", "pvact");
+    a.append(actBtn("download", "Download", () => downloadMany([it])), actBtn("expand", "Open", () => openViewer(S.items.indexOf(it))),
+      actBtn("link", "S3 URI", () => copyText("s3://" + b + "/" + it.key, "S3 URI")), actBtn("rename", "Rename", () => doRename(it)), actBtn("trash", "Delete", () => doDelete([it]), true));
+    box.appendChild(a);
+  }
+  // what is it?
+  let kind = it.kind, mime = MIME[extOf(it.key)] || "";
+  try {
+    const h = await s3("HEAD", b, it.key, {}, { signal });
+    if (!alive()) return;
+    const ct = (h.headers.get("content-type") || "").split(";")[0].trim();
+    if (ct && ct !== "application/octet-stream") kv("type", ct);
+    if (!kind) { kind = kindOf("", ct); if (kind && !mime) mime = ct; }
+    if (!kind && it.size > 0) {
+      const r = await s3("GET", b, it.key, {}, { signal, headers: { range: "bytes=0-4095" } });
+      if (!alive()) return;
+      if (r.ok) {
+        const [k, m] = sniff(new Uint8Array(await r.arrayBuffer()));
+        if (!alive()) return;
+        kind = k; mime = m || mime;
+        kv("detected", k + (m ? " (" + m + ")" : ""));
+      }
+    }
+  } catch (e) { if (!alive()) return; }
+  if (!alive()) return;
+  if (kind && kind !== it.kind) { it.kind = kind; ic.textContent = ""; ic.appendChild(iconFor(it)); bigIcon(); }
+  if (it.size === 0) { msg("Empty file."); return; }
+  const load = async () => {
+    media.textContent = ""; bigIcon();
+    const prog = el("div", "prog"); prog.appendChild(el("i")); media.appendChild(prog);
+    try {
+      if (kind === "text") {
+        const r = await s3("GET", b, it.key, {}, { signal, headers: it.size > TEXT_MAX ? { range: "bytes=0-" + (TEXT_MAX - 1) } : null });
+        if (!r.ok) throw new Error(await s3err(r));
+        let t = new TextDecoder("utf-8").decode(await r.arrayBuffer());
+        if (!alive()) return;
+        if (it.size <= TEXT_MAX && /\.(json|jsonl?)$/i.test(it.key)) { try { t = JSON.stringify(JSON.parse(t), null, 2); } catch (e) {} }
+        media.textContent = "";
+        const pre = el("pre", "", t + (it.size > TEXT_MAX ? "\n\n… first " + fmtBytes(TEXT_MAX) + " of " + fmtBytes(it.size) : ""));
+        media.appendChild(pre);
+        return;
+      }
+      const url = await blobUrl(b, it, mime || (kind === "pdf" ? "application/pdf" : ""), signal, (f) => { prog.firstChild.style.width = Math.round(f * 100) + "%"; });
+      if (!alive()) return;
+      media.textContent = "";
+      if (kind === "image") { const im = el("img"); im.alt = it.name; im.src = url; im.onerror = () => msg("This image could not be decoded by the browser."); media.appendChild(im); }
+      else if (kind === "video") { const v = el("video"); v.controls = true; v.src = url; v.onerror = () => msg("This video format cannot play in the browser."); media.appendChild(v); }
+      else if (kind === "audio") { const a = el("audio"); a.controls = true; a.src = url; media.appendChild(a); }
+      else if (kind === "pdf") { const f = el("iframe"); f.title = it.name; f.src = url; media.appendChild(f); }
+    } catch (e) {
+      if (!alive() || signal.aborted) return;
+      msg("Preview failed: " + e.message);
+    }
+  };
+  const cap = CAP[kind];
+  if (kind === "text") return load();
+  if (!cap) { msg(kind === "archive" ? "Archive: download it to open." : kind === "binary" ? "Binary file: no preview." : "No preview for this type."); return; }
+  if (it.size > cap) {
+    const b2 = el("button", "ghost", "load anyway (" + fmtBytes(it.size) + ")"); b2.type = "button"; b2.onclick = load;
+    msg("Large file: previews download the whole object first.", b2); return;
+  }
+  return load();
+}
+
+// ---------------- full-screen viewer ----------------
+let viewer = null;
+function openViewer(i) {
+  if (i < 0 || !S.items[i] || S.items[i].dir) return;
+  closeViewer();
+  const it = S.items[i];
+  S.cursor = i; if (!S.sel.has(it.id) || S.sel.size !== 1) selectOnly(i); paintSel();
+  const v = el("div", "viewer"); v.setAttribute("role", "dialog"); v.setAttribute("aria-label", it.name);
+  const vh = el("div", "vh");
+  vh.appendChild(iconFor(it));
+  const t = el("div", "t", it.name); t.title = it.key;
+  const files = S.items.filter((x) => !x.dir), fi = files.indexOf(it);
+  vh.append(t, el("span", "s", fmtBytes(it.size) + " · " + (fi + 1) + " / " + files.length), el("span", "grow"));
+  const dl = el("button", "ib"); dl.append(icon("download"), el("span", "lb", "download")); dl.onclick = () => downloadMany([it]);
+  const x = el("button", "ib"); x.append(icon("x")); x.title = "Close (Esc)"; x.onclick = closeViewer;
+  vh.append(dl, x);
+  const vb = el("div", "vb");
+  const prev = el("button", "nav l"); prev.appendChild(icon("back")); prev.disabled = fi <= 0; prev.onclick = () => viewerStep(-1);
+  const next = el("button", "nav r"); next.appendChild(icon("fwd")); next.disabled = fi >= files.length - 1; next.onclick = () => viewerStep(1);
+  const holder = el("div"); holder.style.cssText = "width:100%;height:100%;display:flex;flex-direction:column;justify-content:center";
+  vb.append(holder, prev, next);
+  v.append(vh, vb);
+  v.addEventListener("click", (e) => { if (e.target === vb) closeViewer(); });
+  document.body.appendChild(v);
+  const ac = new AbortController();
+  viewer = { el: v, ac, files, fi };
+  fillPreview(holder, S.bucket, it, ac.signal, () => viewer && viewer.ac === ac, true);
+  x.focus();
+}
+function viewerStep(d) {
+  if (!viewer) return;
+  const nx = viewer.files[viewer.fi + d]; if (!nx) return;
+  openViewer(S.items.indexOf(nx));
+  const e = itemEl(S.cursor); if (e) e.scrollIntoView({ block: "nearest" });
+}
+function closeViewer() { if (!viewer) return; viewer.ac.abort(); viewer.el.remove(); viewer = null; }
+function viewerKey(e) {
+  if (e.key === "Escape" || e.key === " ") { e.preventDefault(); closeViewer(); $("files").focus(); }
+  else if (e.key === "ArrowLeft") { e.preventDefault(); viewerStep(-1); }
+  else if (e.key === "ArrowRight") { e.preventDefault(); viewerStep(1); }
+}
+
+// ---------------- grid thumbnails ----------------
+let thumbObs = null; const thumbQ = []; let thumbBusy = 0;
+function setupThumbs() {
+  const nodes = $("files").querySelectorAll("[data-thumb]");
+  if (!nodes.length) return;
+  thumbObs = new IntersectionObserver((ents) => {
+    for (const en of ents) if (en.isIntersecting) { thumbObs.unobserve(en.target); thumbQ.push(en.target); }
+    pumpThumbs();
+  }, { root: $("files"), rootMargin: "200px" });
+  nodes.forEach((n) => thumbObs.observe(n));
+}
+function pumpThumbs() {
+  while (thumbBusy < 3 && thumbQ.length) {
+    const n = thumbQ.shift(); const it = S.items[+n.dataset.thumb];
+    if (!it || !n.isConnected) continue;
+    thumbBusy++;
+    const b = S.bucket;
+    blobUrl(b, it, MIME[extOf(it.key)] || "image/png").then((url) => {
+      if (!n.isConnected) return;
+      const im = el("img"); im.alt = ""; im.src = url; im.onload = () => { n.textContent = ""; n.appendChild(im); };
+    }, () => {}).finally(() => { thumbBusy--; pumpThumbs(); });
+  }
+}
+
+// ---------------- open / lock ----------------
+const STORE_KEY = "sia-s3-keys";
+function loadKeys() { try { const v = sessionStorage.getItem(STORE_KEY); return v ? JSON.parse(v) : null; } catch (e) { return null; } }
+function saveKeys(c) { try { if (c) sessionStorage.setItem(STORE_KEY, JSON.stringify(c)); else sessionStorage.removeItem(STORE_KEY); } catch (e) {} }
+async function unlock(c, remember) {
+  creds = c; setErr("");
+  $("unlock").disabled = true;
+  try {
+    const r = await s3("GET", "", "", {});
+    if (!r.ok) throw new Error(await s3err(r));
+    S.buckets = Array.from(xmlDoc(await r.text()).getElementsByTagName("Bucket"), (b) => tagText(b, "Name"));
+    if (!S.buckets.length) throw new Error("this deployment has no buckets");
+    if (remember) saveKeys(c);
+    show($("locked"), false); show($("app"), true);
+    const h = parseHash();
+    const st = history.state;
+    navN = st && st.n != null ? st.n : 0; navMax = navN;
+    if (h && S.buckets.includes(h.b)) nav(h.b, h.p, true); else nav(S.buckets[0], "", true);
+    $("files").focus();
+  } catch (e) {
+    creds = null; saveKeys(null);
+    setErr("Could not open the bucket list: " + e.message);
+  } finally { $("unlock").disabled = false; }
+}
+$("unlock").onclick = () => {
+  const ak = $("ak").value.trim(), sk = $("sk").value.trim();
+  if (!ak || !sk) { setErr("Both keys are needed."); return; }
+  $("sk").value = "";
+  unlock({ ak, sk }, $("remember").checked);
+};
+$("sk").addEventListener("keydown", (e) => { if (e.key === "Enter") $("unlock").click(); });
+$("lock").onclick = () => {
+  if (jobs.some((j) => ["queued", "run", "wait"].includes(j.state)) && !confirmLeave()) return;
+  creds = null; saveKeys(null);
+  for (const v of blobs.values()) URL.revokeObjectURL(v.url);
+  blobs.clear(); blobBytes = 0; cache.clear(); S.clip = null; closeViewer();
+  $("files").textContent = ""; $("pv").textContent = ""; delete $("pv").dataset.k;
+  show($("app"), false); show($("locked"), true);
+};
+function confirmLeave() { toast("Transfers are still running: wait for them or cancel them first.", true); return false; }
+
+// toolbar wiring
+ibtn("side-btn", "menu"); ibtn("connect-btn", "plug", "connect"); ibtn("lock", "lock", "lock");
+ibtn("nb-back", "back"); ibtn("nb-fwd", "fwd"); ibtn("nb-up", "up"); ibtn("nb-refresh", "refresh");
+ibtn("ab-upload", "upload", "upload"); ibtn("ab-upfolder", "upload", "folder", true); ibtn("ab-newfolder", "newfolder", "new folder");
+ibtn("ab-download", "download", "download"); ibtn("ab-rename", "rename", "rename", true); ibtn("ab-move", "move", "move", true);
+ibtn("ab-copy", "copy", "copy", true); ibtn("ab-delete", "trash", "delete");
+ibtn("vb-list", "list"); ibtn("vb-grid", "grid"); ibtn("vb-pv", "panel"); ibtn("jobs-min", "chev");
+$("filter").parentNode.prepend(icon("search"));
+$("nb-back").onclick = () => { if (navN > 0) history.back(); };
+$("nb-fwd").onclick = () => { if (navN < navMax) history.forward(); };
+$("nb-up").onclick = () => { if (S.prefix) nav(S.bucket, parentOf(S.prefix)); };
+$("nb-refresh").onclick = () => refresh();
+$("ab-upload").onclick = () => $("upfile").click();
+$("ab-upfolder").onclick = () => $("updir").click();
+$("ab-newfolder").onclick = newFolder;
+$("ab-download").onclick = () => downloadMany(selItems().filter((x) => !x.dir));
+$("ab-rename").onclick = () => doRename(selItems()[0]);
+$("ab-move").onclick = () => doTransferDialog(selItems(), "move");
+$("ab-copy").onclick = () => doTransferDialog(selItems(), "copy");
+$("ab-delete").onclick = () => doDelete(selItems());
+$("vb-list").onclick = () => { S.view = "list"; lsSet("view", "list"); render(); };
+$("vb-grid").onclick = () => { S.view = "grid"; lsSet("view", "grid"); render(); };
+$("vb-pv").onclick = () => { S.pv = !S.pv; lsSet("pv", S.pv); delete $("pv").dataset.k; render(); };
+$("lhead").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-sort]"); if (!b) return;
+  const by = b.dataset.sort;
+  S.sort = { by, dir: S.sort.by === by ? -S.sort.dir : by === "name" ? 1 : -1 }; lsSet("sort", S.sort);
+  applyView(); render();
+});
+$("sortsel").onchange = (e) => { const by = e.target.value; S.sort = { by, dir: by === "name" ? 1 : -1 }; lsSet("sort", S.sort); applyView(); render(); };
+let filterT = 0;
+$("filter").addEventListener("input", (e) => { clearTimeout(filterT); filterT = setTimeout(() => { S.filter = e.target.value; applyView(); render(); }, 80); });
+$("side-btn").onclick = () => $("side").classList.toggle("open");
+$("connect-btn").onclick = () => dialog({ title: "Connect an S3 client", node: $("connect-body"), wide: true, buttons: [{ label: "close", value: null, kind: "primary" }] });
+$("pill").onclick = () => { status(); dialog({ title: "Status", node: $("status-body"), wide: true, buttons: [{ label: "close", value: null, kind: "primary" }] }); };
+document.addEventListener("click", (e) => { const sd = $("side"); if (sd.classList.contains("open") && !sd.contains(e.target) && e.target !== $("side-btn") && !$("side-btn").contains(e.target)) sd.classList.remove("open"); });
+// the main pane is also a drop target for files (outside the list itself, e.g. the header)
+$("main").addEventListener("dragover", (e) => { if (isFiles(e)) { e.preventDefault(); dropOverlay(true, null); } });
+$("main").addEventListener("dragleave", (e) => { if (!$("main").contains(e.relatedTarget)) dropOverlay(false); });
+$("main").addEventListener("drop", (e) => {
+  if (!isFiles(e)) return;
+  e.preventDefault(); dropOverlay(false);
+  filesFromDrop(e.dataTransfer).then((l) => enqueueUploads(l, S.bucket, S.prefix));
+});
+// a stray drop outside any target must not navigate the tab away to the file
+window.addEventListener("dragover", (e) => { if (e.dataTransfer.types.includes("Files")) e.preventDefault(); });
+window.addEventListener("drop", (e) => { if (e.dataTransfer.types.includes("Files")) { e.preventDefault(); dropOverlay(false); } });
+window.addEventListener("resize", () => { delete $("pv").dataset.k; schedulePreview(); });
+
+status();
+setInterval(status, 15000);
+const kept = loadKeys();
+if (kept) status().then(() => unlock(kept, true));
+</script>
+</body>
+</html>
