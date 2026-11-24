@@ -1,6 +1,25 @@
 # Packaged standard GPU applications
 
-## 0.6.12 direct candidate 2 (2026-11-24): running in measured guests
+## In production as native SVN25 (2026-11-24)
+
+The overlay of candidate 2 below is in the native desktop image SVN25, live on
+nucbox-k11-4 since 08:39Z on 2026-11-24. The recipe and the release record are
+in `../../guest/native/releases/svn25/`. Two files of the native tree were
+kept, `libggml-shielded.so` and `libshield-core.so`, because they carry the
+Unix-socket worker route; the new executor needs no symbol they lack.
+
+On those bytes, in a container: `sd-cli` gives the fixture PNG with 392
+exchanges, and `llama-cli` through OpenCL runs at 98.8 tokens a second against
+the native route's 94.6 on two processors and 109.6 against 109.8 on six (the
+small Qwen model; SVN23's tree gave 94 against 104). Nothing has yet run
+inside the production desktop, which only its owner can start.
+
+Candidate 2's development guests and the test worker were stopped once SVN25
+was live. Before that `sd-cli --backend GPUOpenCL` also ran in the desktop
+guest: exit 0 and a `q8` session of 392 verified exchanges and 51,921,289,216
+MACs, the fixture's counts. The fault runs were not made in a guest.
+
+## 0.6.12 direct candidate 2 (2026-11-24): ran in measured guests
 
 `enclave-kvm-box-desktop:0.6.12-direct-candidate-2`
 (`sha256:55ebfefe78ee3dbe0f759567161fc92b6f8d4aa825fc8aaaebe2e8a05d3fd69c`)
