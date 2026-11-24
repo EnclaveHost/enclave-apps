@@ -16,7 +16,7 @@ if args.set_runtime_dir:
  command=[str(runtime/'ld-linux-x86-64.so.2'),'--library-path',str(runtime),str(runtime/'wasmtime'),'run','-C','cache=n','-C','parallel-compilation=n','-W','max-memory-size=6442450944','-W','threads,shared-everything-threads,component-model-threading,shared-memory,memory64,component-model-memory64','-S','cli,tcp,inherit-network','-S','allow-ip-name-lookup=n','-S','udp=n','--env','ENCLAVE_AVAILABLE_PARALLELISM=1']
 else:
  command=[args.wasmtime,'run','-S','nn','-S','inherit-network','-S','allow-ip-name-lookup=n','-S','udp=n']
-http=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
 # A tiny ELF guest increments a counter in RAM continuously; no Linux/network.
 code=struct.pack('<4I',0x00002097,0x00128293,0x0050a023,0xff9ff06f)
 elf=bytearray(b'\x7fELF\x02\x01\x01'+b'\0'*9)
@@ -48,7 +48,7 @@ def app(cfg,label):
   if body is not None:headers['Content-Type']='application/json'
   r=urllib.request.Request(f'http://127.0.0.1:{port}'+path,data=json.dumps(body).encode() if body is not None else None,headers=headers)
   try:
-   with http.open(r,timeout=8) as res:return res.status,json.load(res)
+   with opener.open(r,timeout=8) as res:return res.status,json.load(res)
   except urllib.error.HTTPError as e:return e.code,json.load(e)
  def phase(want):
   last=None;end=time.monotonic()+90
