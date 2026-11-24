@@ -34,10 +34,9 @@
 //! user, or anything the model did not put in the call. That is a real disclosure
 //! and it is why the playground's tools switch starts off.
 //!
-//! REACHABILITY: outbound egress on this fleet is IPv6-ONLY. A tool endpoint
-//! whose host publishes no AAAA record cannot be dialled at all - see
-//! http::egress_err, which says so in the failure rather than leaving an
-//! operator hunting for a bad token.
+//! REACHABILITY: tool calls use the deployment's configured outbound route.
+//! Diagnose DNS, provider availability and target health from live probes;
+//! a connection refusal alone does not identify an IP-family restriction.
 //!
 //! MCP, specifically: the streamable-HTTP transport only (JSON-RPC over POST).
 //! stdio is impossible here - a wasm component has no subprocesses - and there

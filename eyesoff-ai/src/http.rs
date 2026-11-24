@@ -284,51 +284,25 @@ pub fn resolve_url(base: &str, loc: &str) -> String {
     format!("{scheme}://{authority}{dir}{loc}")
 }
 
-/// Turn an outbound failure into an error that names the actual cause.
-///
-/// A bare "ErrorCode::ConnectionRefused" sends you hunting for a bad API key,
-/// a firewall or a TLS problem. On this platform it almost always means one
-/// thing: a deployment's outbound egress leaves from its own dedicated IPv6
-/// and is IPv6-ONLY, so a host that publishes no AAAA record cannot be
-/// dialled. Measured against a live deployment 2026-07-29 - example.com,
-/// wikipedia, serpapi and exa (all dual-stack) connected; brave, serper and
-/// duckduckgo (all IPv4-only) were refused, every time.
+/// Preserve the transport error without inferring DNS, IP-family, or funding
+/// state from a connection refusal. These checks require live evidence.
 pub fn egress_err(authority: &str, err: &str) -> String {
-    let host = authority.split(':').next().unwrap_or(authority);
-    // a literal address or loopback is local dev, not the IPv6 story - telling
-    // someone to `dig AAAA 127.0.0.1` is just noise
-    let is_literal = host == "localhost"
-        || host.starts_with('[')
-        || host.parse::<std::net::IpAddr>().is_ok();
-    if !is_literal && (err.contains("ConnectionRefused") || err.contains("ConnectionTimeout")) {
-        // An Enclave app URL deserves its own answer. The generic "pick a
-        // dual-stack provider" advice is useless here - you cannot pick a
-        // different DNS record for your own deployment, and the reflex is to go
-        // looking at the target app, which is usually the wrong place.
-        //
-        // The one thing that has to hold for app-to-app to work at all is that
-        // the gateway answers on IPv6, because a deployment's egress is
-        // IPv6-only. Re-measured 2026-07-29: the wildcard *.app.enclave.host
-        // DOES resolve dual-stack (46.62.128.36 and 2a01:4f9:c013:9b52::1, the
-        // same v6 for every name), so this is no longer the flat "impossible"
-        // it was first written as - a refusal now means the gateway is not
-        // accepting v6 for that name, or the target deployment is not running.
+    let host = if authority.starts_with('[') {
+        authority.split(']').next().unwrap_or(authority).trim_start_matches('[')
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+    if err.contains("ConnectionRefused") || err.contains("ConnectionTimeout") {
         if host.ends_with(".app.enclave.host") {
             return format!(
-                "cannot reach {host} ({err}). That is another Enclave deployment's app URL, and \
-                 this deployment's outbound egress is IPv6-ONLY, so app-to-app depends on the \
-                 gateway answering over v6 for that name. Check the record with \
-                 `dig AAAA {host}` (the wildcard did publish an AAAA as of 2026-07-29), then \
-                 check the target is up and funded. This deployment's own view of it is one \
-                 request: GET /search?url=https://{host}/ping - which tests the egress path \
-                 without any inference in the way."
+                "cannot reach {host} ({err}). Check that this Enclave deployment has an active \
+                 host lease and a current public route. Check both A and AAAA DNS records; \
+                 a missing AAAA record alone does not establish an egress failure. This deployment can test the path with an authenticated GET /search?url=https://{host}/ping request."
             );
         }
         return format!(
-            "cannot reach {host} ({err}). This deployment's outbound egress is IPv6-ONLY, \
-             so a host with no AAAA record is unreachable - check with `dig AAAA {host}`. \
-             brave, serper, tavily and duckduckgo are IPv4-only and CANNOT be used here; \
-             exa and serpapi are dual-stack and work."
+            "cannot reach {host} ({err}). Check the target's DNS records, listening port and \
+             this deployment's outbound route. This error alone does not identify the cause."
         );
     }
     format!("request to {host} failed: {err}")
@@ -353,35 +327,18 @@ mod tests {
     }
 
     #[test]
-    fn connection_refused_explains_ipv6_only_egress() {
-        // the message that would have saved a debugging session
-        let m = egress_err("api.search.brave.com", "ErrorCode::ConnectionRefused");
-        assert!(m.contains("IPv6-ONLY"), "{m}");
-        assert!(m.contains("dig AAAA api.search.brave.com"), "{m}");
-        // ports are stripped from the advice
-        assert!(!egress_err("api.exa.ai:443", "ErrorCode::ConnectionRefused").contains(":443"));
-        // literal addresses are local dev, not the IPv6 story
-        for h in ["127.0.0.1", "localhost", "[::1]"] {
-            let m = egress_err(h, "ErrorCode::ConnectionRefused");
-            assert!(!m.contains("IPv6-ONLY"), "{h}: {m}");
+    fn connection_errors_preserve_evidence_without_guessing_ip_family() {
+        for cause in ["ErrorCode::ConnectionRefused", "ErrorCode::ConnectionTimeout"] {
+            for host in ["api.example.com", "127.0.0.1", "localhost", "[2001:db8::1]:443"] {
+                let m = egress_err(host, cause);
+                assert!(m.contains(cause), "{m}");
+                assert!(!m.contains("IPv6-ONLY"), "{m}");
+            }
+            let m = egress_err("38f368d6.app.enclave.host:443", cause);
+            assert!(m.contains("active host lease") && m.contains("public route"), "{m}");
+            assert!(!m.contains(":443"), "{m}");
         }
-        // unrelated failures keep their own wording
-        let m = egress_err("api.exa.ai", "ErrorCode::TlsProtocolError");
-        assert!(!m.contains("IPv6-ONLY"), "{m}");
-        assert!(m.contains("TlsProtocolError"), "{m}");
-    }
-
-    #[test]
-    fn app_to_app_gets_its_own_diagnosis() {
-        let m = egress_err("da09d0f2.app.enclave.host", "ErrorCode::ConnectionRefused");
-        assert!(m.contains("another Enclave deployment"), "{m}");
-        // it names the probe that answers the question without inference in the way
-        assert!(m.contains("/search?url=https://da09d0f2.app.enclave.host/ping"), "{m}");
-        // the generic provider advice would be actively misleading here
-        assert!(!m.contains("exa and serpapi"), "{m}");
-        // a non-Enclave host still gets the provider advice
-        let m = egress_err("api.search.brave.com", "ErrorCode::ConnectionRefused");
-        assert!(m.contains("exa and serpapi"), "{m}");
-        assert!(!m.contains("another Enclave deployment"), "{m}");
+        assert!(egress_err("[2001:db8::1]:443", "TlsProtocolError").contains("2001:db8::1"));
+        assert_eq!(egress_err("api.example.com", "TlsProtocolError"), "request to api.example.com failed: TlsProtocolError");
     }
 }

@@ -7,8 +7,8 @@
 //! The host owns the transport. It resolves the name, opens the socket, does
 //! TLS, and synthesizes the `host` header from the authority (a guest may not
 //! set `host` itself). On the fleet a deployment's outbound requests leave
-//! through its egress front, which is IPv6-only: an endpoint with no AAAA
-//! record cannot be dialled at all, and `egress_err` says so.
+//! through its configured outbound route. Connection failures need live DNS,
+//! route and destination checks; they do not establish an IP-family limit.
 
 use crate::bindings::wasi::http::outgoing_handler;
 use crate::bindings::wasi::http::types::{
@@ -155,28 +155,25 @@ pub fn split_url(url: &str) -> Result<(String, String, String), String> {
     Ok((scheme.to_ascii_lowercase(), authority, path))
 }
 
-/// Turn an outbound failure into an error that names the actual cause. On
-/// this platform a refused connection almost always means one thing: the
-/// deployment's egress is IPv6-only and the endpoint published no AAAA
-/// record. An Enclave app URL gets its own answer, because the reflex there
-/// is to go looking at the wrong deployment.
+/// Preserve the transport error without inferring DNS, IP-family, or funding
+/// state from a connection refusal. These checks require live evidence.
 pub fn egress_err(authority: &str, err: &str) -> String {
-    let host = authority.split(':').next().unwrap_or(authority);
-    let is_literal = host == "localhost"
-        || host.starts_with('[')
-        || host.parse::<std::net::IpAddr>().is_ok();
-    if !is_literal && (err.contains("ConnectionRefused") || err.contains("ConnectionTimeout")) {
+    let host = if authority.starts_with('[') {
+        authority.split(']').next().unwrap_or(authority).trim_start_matches('[')
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+    if err.contains("ConnectionRefused") || err.contains("ConnectionTimeout") {
         if host.ends_with(".app.enclave.host") {
             return format!(
-                "cannot reach {host} ({err}). That is another Enclave deployment's app URL, and \
-                 this deployment's outbound egress is IPv6-ONLY, so app-to-app depends on the \
-                 gateway answering over v6 for that name (`dig AAAA {host}`); then check the \
-                 target is up and funded."
+                "cannot reach {host} ({err}). Check that this Enclave deployment has an active \
+                 host lease and a current public route. Check both A and AAAA DNS records; \
+                 a missing AAAA record alone does not establish an egress failure."
             );
         }
         return format!(
-            "cannot reach {host} ({err}). This deployment's outbound egress is IPv6-ONLY, \
-             so a host with no AAAA record is unreachable - check with `dig AAAA {host}`."
+            "cannot reach {host} ({err}). Check the target's DNS records, listening port and \
+             this deployment's outbound route. This error alone does not identify the cause."
         );
     }
     format!("request to {host} failed: {err}")
@@ -195,14 +192,18 @@ mod tests {
     }
 
     #[test]
-    fn refusals_explain_ipv6_only_egress() {
-        let m = egress_err("api.example.com", "ErrorCode::ConnectionRefused");
-        assert!(m.contains("IPv6-ONLY") && m.contains("dig AAAA api.example.com"), "{m}");
-        let m = egress_err("da09d0f2.app.enclave.host", "ErrorCode::ConnectionRefused");
-        assert!(m.contains("another Enclave deployment"), "{m}");
-        for h in ["127.0.0.1", "localhost", "[::1]"] {
-            assert!(!egress_err(h, "ErrorCode::ConnectionRefused").contains("IPv6-ONLY"), "{h}");
+    fn connection_errors_preserve_evidence_without_guessing_ip_family() {
+        for cause in ["ErrorCode::ConnectionRefused", "ErrorCode::ConnectionTimeout"] {
+            for host in ["api.example.com", "127.0.0.1", "localhost", "[2001:db8::1]:443"] {
+                let m = egress_err(host, cause);
+                assert!(m.contains(cause), "{m}");
+                assert!(!m.contains("IPv6-ONLY"), "{m}");
+            }
+            let m = egress_err("38f368d6.app.enclave.host:443", cause);
+            assert!(m.contains("active host lease") && m.contains("public route"), "{m}");
+            assert!(!m.contains(":443"), "{m}");
         }
-        assert!(egress_err("x.y", "ErrorCode::TlsProtocolError").contains("TlsProtocolError"));
+        assert!(egress_err("[2001:db8::1]:443", "TlsProtocolError").contains("2001:db8::1"));
+        assert_eq!(egress_err("api.example.com", "TlsProtocolError"), "request to api.example.com failed: TlsProtocolError");
     }
 }
