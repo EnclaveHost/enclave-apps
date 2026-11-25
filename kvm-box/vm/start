@@ -1,0 +1,52 @@
+#!/bin/sh
+# /vm/start - the desktop of the KVM Box whole-VM guest, run by vm-init (PID 1) from the verified root.
+# The same services as the original single-guest start script (../guest/desktop-start.sh), ending in the whole-VM
+# front instead of the per-app one. When this script ends, vm-init powers the guest off: any step that fails ends it.
+set -eu
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+mount -t proc -o hidepid=2 proc /proc
+mount -t sysfs sysfs /sys
+mount -t tmpfs -o size=256m,mode=1777 tmpfs /tmp
+mount -t tmpfs -o size=64m,mode=0755 tmpfs /run
+mkdir -p /dev/shm /dev/pts
+mount -t tmpfs -o size=1g,mode=1777 tmpfs /dev/shm
+mount -t devpts -o mode=0620,ptmxmode=0666 devpts /dev/pts
+mount -t configfs configfs /sys/kernel/config
+busybox hostname kvm-box
+busybox ip link set lo up
+# Outbound-only user networking: the host forwards exactly one port, the front's, into the guest.
+for p in /sys/class/net/*; do
+ n=${p##*/}; [ "$n" = lo ] && continue
+ busybox ip link set "$n" up
+ busybox ip addr add 10.0.2.15/24 dev "$n"
+ busybox ip route add default via 10.0.2.2
+ break
+done
+printf 'nameserver 10.0.2.3\n' > /etc/resolv.conf
+mkdir -p /run/dbus /run/user/1000 /home/desktop/.fluxbox
+chown 1000:1000 /run/user/1000
+chmod 0700 /run/user/1000
+# Guest-only virtual input devices for Sunshine, never the host's.
+/usr/lib/systemd/systemd-udevd --daemon
+udevadm trigger
+udevadm settle
+chmod 0660 /dev/uhid /dev/uinput
+chown 1000:1000 /dev/uhid /dev/uinput
+# Sunshine's own web credential is made per boot and stays in the guest; the helper uses it for PIN pairing.
+busybox head -c 32 /dev/urandom | busybox base64 > /run/sunshine-password
+chmod 0600 /run/sunshine-password
+HOME=/home/desktop sunshine /sunshine.conf --creds owner "$(cat /run/sunshine-password)" > /tmp/sunshine-setup.log 2>&1
+chown -R 1000:1000 /home/desktop
+chown 1000:1000 /tmp/sunshine-internal.log
+chmod 0700 /home/desktop
+dbus-uuidgen > /etc/machine-id
+nice -n -5 Xorg :0 -config /xorg.conf -noreset -nolisten tcp -novtswitch -sharevts -ac > /tmp/xorg.log 2>&1 &
+for i in $(seq 1 100); do DISPLAY=:0 xdpyinfo >/dev/null 2>&1 && break; sleep .1; done
+DISPLAY=:0 xdpyinfo >/dev/null 2>&1 || { echo 'VMSTART: Xorg did not start'; tail -5 /tmp/xorg.log; exit 1; }
+su -s /bin/sh desktop -c 'export DISPLAY=:0 HOME=/home/desktop; exec dbus-run-session -- /desktop-session.sh' > /tmp/session.log 2>&1 &
+x11vnc -display :0 -localhost -forever -shared -nopw -rfbport 5900 -quiet > /tmp/vnc.log 2>&1 &
+websockify --web=/usr/share/novnc 127.0.0.1:6080 127.0.0.1:5900 > /tmp/websockify.log 2>&1 &
+/helper gateway > /tmp/helper.log 2>&1 &
+echo "VMSTART: desktop started, $(grep MemAvailable /proc/meminfo | tr -s ' ')"
+# The front holds the guest's TLS key and its attestation; it is the only listener the host can reach.
+exec /vm/vmfront -listen :8443 -upstream 127.0.0.1:8000 -ports /vm/app.ports
