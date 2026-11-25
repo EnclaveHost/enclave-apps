@@ -14,7 +14,8 @@ mount -t devpts -o mode=0620,ptmxmode=0666 devpts /dev/pts
 mount -t configfs configfs /sys/kernel/config
 busybox hostname kvm-box
 busybox ip link set lo up
-# Outbound-only user networking: the host forwards exactly one port, the front's, into the guest.
+# Where the platform gives the guest a network card (QEMU's user networking: outbound only, and the host forwards
+# exactly one port, the front's) it is brought up; where it gives none (an Enclave Shield host) there is none to find.
 for p in /sys/class/net/*; do
  n=${p##*/}; [ "$n" = lo ] && continue
  busybox ip link set "$n" up
@@ -49,4 +50,5 @@ websockify --web=/usr/share/novnc 127.0.0.1:6080 127.0.0.1:5900 > /tmp/websockif
 /helper gateway > /tmp/helper.log 2>&1 &
 echo "VMSTART: desktop started, $(grep MemAvailable /proc/meminfo | tr -s ' ')"
 # The front holds the guest's TLS key and its attestation; it is the only listener the host can reach.
-exec /vm/vmfront -listen :8443 -upstream 127.0.0.1:8000 -ports /vm/app.ports
+# TCP is how a host with a network reaches it, the socket port how a host without one does: the same on every platform.
+exec /vm/vmfront -listen :8443 -vsock 8443 -upstream 127.0.0.1:8000 -ports /vm/app.ports
