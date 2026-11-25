@@ -1,0 +1,9 @@
+{
+  "passed": true,
+  "against": "native-models-image-v23 (SVN26, the live release)",
+  "changes": [
+    "plat/native-boot",
+    "plat/native-desktop/profile.json"
+  ],
+  "allOtherEntriesIdentical": true
+}

@@ -1,0 +1,117 @@
+{
+  "schema": "enclave-native-platform-candidate/1",
+  "imageRole": "desktop",
+  "scope": "SVN27 candidate. The OpenCL frontend in the root image is rebuilt from enclave-apps main bb54abc: its SwiGLU glue kernel has a sixteen-lane form (same bits as the eight-lane one). Everything else is SVN26, the model volume included. Built and signed only; not staged.",
+  "files": {
+    "native.cpio.gz": {
+      "file": "native.cpio.gz",
+      "bytes": 32741075,
+      "sha256": "cd5445d3b0d3edbf3eafc56202a6020e3013694d0af0c8a7653bef0d0ee8b2a7"
+    },
+    "native-igvm.bin": {
+      "file": "native-igvm.bin",
+      "bytes": 86637572,
+      "sha256": "45d7352a4e4dcc13b51adf60dc278526126f0f16c9c7b252d4c7d6016209be57"
+    },
+    "profile.json": {
+      "file": "profile.json",
+      "bytes": 1069,
+      "sha256": "9a66d38d0ce89892342c86498311efb9fcfad3527980d67bcef718b4be1337ea"
+    },
+    "root.iso": {
+      "file": "root.iso",
+      "bytes": 596525056,
+      "sha256": "106c487109fa1ac75e9ca1d61bd0036044fd8d80390595b66f6ccb1a23486c15",
+      "payloadOffset": 65536,
+      "payloadBytes": 596459520,
+      "payloadSha256": "1d36df1296ec41f82e28f08c483e7c13cdc44c1526f48cc95ba73ed7031098cf"
+    },
+    "hashes.iso": {
+      "file": "hashes.iso",
+      "bytes": 4767744,
+      "sha256": "92ec16f4fb74a087dc2d8ccb73ea19c2f3423a6cfc98802b5c6bfe25b6c193bf",
+      "payloadOffset": 65536,
+      "payloadBytes": 4702208,
+      "payloadSha256": "7a0f3c36d87386694037fd547c223baffff8a1297ca9eb7e0fd9213872b67000"
+    },
+    "shield-desktop.wasm": {
+      "file": "shield-desktop.wasm",
+      "bytes": 508270,
+      "sha256": "e05247f88eb521d48507ff49bb88d16b5bba2df75fb2794b2082382ae7506630"
+    },
+    "models.iso": {
+      "file": "models.iso",
+      "bytes": 20794515456,
+      "sha256": "2887bde950db7bca139b5b4317cc2027ac391e601068d6d75197d157924db964",
+      "payloadOffset": 65536,
+      "payloadBytes": 20794449920,
+      "payloadSha256": "8328f013954489c0af709d95f8c93bb62bb832ac6bd019807e7736868dc4592a"
+    }
+  },
+  "profileSha256": "9a66d38d0ce89892342c86498311efb9fcfad3527980d67bcef718b4be1337ea",
+  "controllerSha256": "e05247f88eb521d48507ff49bb88d16b5bba2df75fb2794b2082382ae7506630",
+  "runtimeId": "f548e338e4e41bb1326693688c7b0067c9f330a24f4a21a61037bd334449c74f",
+  "vbsLaunchDigest": "3ec3a6036c7c0a52bf727051180510d858b5035d160aa6aed930d9395ef51164",
+  "imageIdentity": {
+    "moduleId": 1802724708,
+    "productId": 1818455653,
+    "signer": "c47c23318e325d23a9c0110f6b6aa59d80cd8f24629b1a5fe77fbb6fb9c5e89d"
+  },
+  "guestSvn": 27,
+  "sourceUnsignedImageSha256": "1c95a3b9910103e04e951a2d88b9fdef723b3d9a5199ae66b2bb2efaec8bdd9a",
+  "signatureLocallyVerified": true,
+  "signingManifest": "signing.json",
+  "evidence": "independent-signature-verification.json",
+  "appSourceCommit": "4c48c9076e244b6abff8546be1f34952f649942a",
+  "appSourceBranch": "kvm-box/shield-opencl-perf (local, not pushed); only shield-compute differs from 2bcae2109bd9f0e5883c19c8affb2b4d513ae3b1; and xdoom from xdoomSourceCommit",
+  "xdoomSourceCommit": "0d638275e4e7c755c406f4bd23b5f706f42f39fd",
+  "shieldOverlayCommit": "bb54abc0720d9809bd2c0ec27361c06b0b7e543b",
+  "graphicsSourceCommit": "7f2f7063fbd23efc819c9179f0add5b32555a681",
+  "platformSourceCommit": "3ee89bc1678c70237d27658beb76f4911b3dac8c",
+  "platformSourceMainCommit": "f56ff8912",
+  "rootChanged": [
+    "opt/shield/files.sha256.json",
+    "opt/shield/opencl/lib/libOpenCL.so.1",
+    "opt/shield/standard/inputs.json",
+    "opt/shield/standard/overlay-files.json",
+    "opt/shield/standard/source-declines/build-receipt.json",
+    "opt/shield/standard/source-declines/command.json"
+  ],
+  "platformArchiveChangedAgainstV20": [
+    "plat/native-boot",
+    "plat/native-desktop/profile.json"
+  ],
+  "isolatedNativeKvmQualified": true,
+  "isolatedNativeEvidence": "desktop-test.json",
+  "isolatedNativeEvidenceIsOf": "this root image and the model volume of SVN26, valid case only; the two corruption cases were not repeated",
+  "isolatedGraphicsQualificationRepeated": false,
+  "computeRouteExercised": "in the desktop container with these files and a test worker, not in a booted guest",
+  "computeOverlayExercisedInContainer": true,
+  "gameExercisedInBootedGuest": false,
+  "purchasedShareContractExercisedInBootedGuest": false,
+  "archiveRebuiltFromFreshCache": null,
+  "previousCandidate": "native-platform-v23-27b-models",
+  "modelVolume": {
+    "name": "kvm-box-public-models-v5",
+    "files": [
+      "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+      "qwen2.5-0.5b-instruct-q8_0.gguf",
+      "sd15-q8.gguf"
+    ],
+    "rootHash": "52703ab7ab78f0e44b0bcb740a3cf6d2afa7c6af4a7b49d1ba4647273f1b66cb",
+    "gguf27Sha256": "3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e"
+  },
+  "finalImageRuntimeQualified": false,
+  "hardwareAttestationChainVerified": false,
+  "admissionEnabled": false,
+  "activated": false,
+  "hostOsExcluded": false,
+  "containsTestPrograms": false,
+  "controllerBundleIncluded": true,
+  "startupReliabilityQualified": false,
+  "controlledSlowStorageStartupPassed": false,
+  "startupInnerDeadlineMs": 115000,
+  "startupOuterDeadlineMs": 120000,
+  "requiredBridgeSha256": "cc751de67c7d303f989367e1ac5ed5eb316f2b13cd10be74ff44256551d18d73",
+  "driverSha256": "038d5c4bf64fafdc8eb45b5c4634262c450f49dc0e4a48995f8486c714e70020"
+}

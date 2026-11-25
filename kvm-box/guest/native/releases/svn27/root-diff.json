@@ -1,0 +1,13 @@
+{
+  "passed": true,
+  "against": "native-models-image-v23 (the root image of SVN26)",
+  "changes": [
+    "opt/shield/files.sha256.json",
+    "opt/shield/opencl/lib/libOpenCL.so.1",
+    "opt/shield/standard/inputs.json",
+    "opt/shield/standard/overlay-files.json",
+    "opt/shield/standard/source-declines/build-receipt.json",
+    "opt/shield/standard/source-declines/command.json"
+  ],
+  "allOtherEntriesIdentical": true
+}
